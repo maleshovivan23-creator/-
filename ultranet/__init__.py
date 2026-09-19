@@ -3,7 +3,7 @@
 Собственный автоград, современные слои (RoPE, RMSNorm, SwiGLU, MHA с KV-кэшем),
 оптимизаторы (AdamW, Lion, Lookahead, EMA), тренер и модели вплоть до GPT.
 """
-from . import checkpoint, data, functional, models, nn, optim, tokenizer
+from . import checkpoint, data, functional, models, nn, optim, proteus, tokenizer
 from .data import (
     CharTokenizer,
     DataLoader,
@@ -63,14 +63,14 @@ from .gradcheck import gradcheck, numeric_grad
 from .tokenizer import BPETokenizer
 from .trainer import Trainer
 
-__version__ = "3.0.0"
+__version__ = "4.0.0"
 
 __all__ = [
     # ядро
     "Tensor", "tensor", "zeros", "ones", "randn", "stack", "cat", "no_grad",
     "manual_seed", "get_rng",
     # пакеты
-    "nn", "optim", "data", "functional", "models",
+    "nn", "optim", "data", "functional", "models", "proteus",
     # модели
     "MLP", "ConvNet", "ResNet", "GPT", "GPTConfig", "TextClassifier",
     # оптимизаторы и расписания
