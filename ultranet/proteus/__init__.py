@@ -10,6 +10,9 @@ from .growth import (LADDER, GrowingProteus, GrowthState, HardwareProfile,
 from .experts import MoE, Expert
 from .shards import Shard, ShardedSwarm, SwarmNode
 from .steering import SteeringLibrary, SteeringVector
+from .weights import (RVQ, ComplexWeight, FisherImportance, FractalStack,
+                      HyperNetwork, LogPolarWeight, SphericalWeight,
+                      compare_methods, cosine, rel_error, slerp)
 from .bytes import ByteTokenizer, make_byte_batches
 from .controller import MetaController, Plan
 from .devices import DEVICES, Device, DeviceState, get_device, list_devices
@@ -26,6 +29,9 @@ __all__ = [
     "Capsule", "CapsuleRegistry", "Level",
     "CATALOG", "BY_KEY", "CapsuleSpec", "Group", "Stage", "by_group",
     "ProteusBody", "Assembly", "detect_triggers",
+    "SphericalWeight", "LogPolarWeight", "RVQ", "FisherImportance",
+    "FractalStack", "ComplexWeight", "HyperNetwork", "compare_methods",
+    "rel_error", "cosine", "slerp",
     "GrowingProteus", "GrowthState", "HardwareProfile", "probe_hardware",
     "LADDER", "stage_at", "next_stage", "ladder_table",
     "Shard", "ShardedSwarm", "SwarmNode",
