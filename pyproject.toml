@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ultranet"
+version = "7.0.0"
+description = "Ультимативная нейросетевая библиотека на чистом NumPy: автоград, слои, оптимизаторы, GPT"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+torch = ["torch>=2.0"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+ultranet = "ultranet.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ultranet*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "slow: тесты дольше ~3 секунд (обучение, RL, квантование реальных моделей)",
+]
