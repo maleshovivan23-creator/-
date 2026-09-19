@@ -5,6 +5,8 @@ from .capsules import Capsule, CapsuleRegistry, Level
 from .catalog import CATALOG, BY_KEY, CapsuleSpec, Group, Stage, by_group
 from .context import Activity, AdaptationLoops, Context, Place, Style, style_for
 from .core import Proteus, Response
+from .growth import (LADDER, GrowingProteus, GrowthState, HardwareProfile,
+                     ladder_table, next_stage, probe_hardware, stage_at)
 from .experts import MoE, Expert
 from .shards import Shard, ShardedSwarm, SwarmNode
 from .steering import SteeringLibrary, SteeringVector
@@ -24,6 +26,8 @@ __all__ = [
     "Capsule", "CapsuleRegistry", "Level",
     "CATALOG", "BY_KEY", "CapsuleSpec", "Group", "Stage", "by_group",
     "ProteusBody", "Assembly", "detect_triggers",
+    "GrowingProteus", "GrowthState", "HardwareProfile", "probe_hardware",
+    "LADDER", "stage_at", "next_stage", "ladder_table",
     "Shard", "ShardedSwarm", "SwarmNode",
     "Context", "Activity", "Place", "Style", "style_for", "AdaptationLoops",
     "ByteTokenizer", "make_byte_batches",

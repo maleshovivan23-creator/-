@@ -93,7 +93,7 @@ class Assembly:
     def heavy_active(self, threshold: int = 50_000_000) -> List[CapsuleSpec]:
         """Тяжёлые капсулы (>50M) — именно они определяют реальную цену."""
         return [c for c in self.active
-                if c.params_for(self.device.tier) >= threshold]
+                if c.params_for(self.device) >= threshold]
 
     @property
     def fits(self) -> bool:
@@ -110,7 +110,7 @@ class Assembly:
 
     def energy_fraction(self) -> float:
         """Грубая доля энергии: активные параметры от полного тела."""
-        total = sum(c.params_for(self.device.tier) for c in CATALOG
+        total = sum(c.params_for(self.device) for c in CATALOG
                     if c.fits_on(self.device))
         return self.params / max(total, 1)
 
@@ -150,12 +150,12 @@ class Assembly:
             lines.append(f"  [{stage_names[st]}]")
             for c in caps:
                 n += 1
-                p = c.params_for(self.device.tier)
+                p = c.params_for(self.device)
                 lines.append(f"    {n:>2}. {c.name:<26} {p / 1e6:>8.1f}M  {c.does[:44]}")
         lines.append("")
         n_heavy = len(self.heavy_active())
         total_heavy = len([c for c in CATALOG
-                           if c.params_for(self.device.tier) >= 50_000_000])
+                           if c.params_for(self.device) >= 50_000_000])
         lines.append(f"активно {self.n_active} из {len(CATALOG)} капсул "
                      f"({self.capsule_fraction * 100:.0f}%), из них в конвейере "
                      f"{len(self.foreground)} ({self.foreground_fraction * 100:.0f}%)")
@@ -218,7 +218,7 @@ class ProteusBody:
         unavailable = [BY_KEY[k] for k in sorted(needed - avail)]
         chosen = [BY_KEY[k] for k in sorted(needed & avail)]
 
-        tier = self.device.tier
+        tier = self.device          # передаём устройство: размер зависит от RAM
         budget = self.state.available_bytes
         # приоритет: всегда включённые и ранние стадии выживают первыми
         chosen.sort(key=lambda c: (not c.always_on, int(c.stage), -c.params_for(tier)))
@@ -246,7 +246,7 @@ class ProteusBody:
     # --------------------------------------------------------- как дерево
     def to_registry(self, assembly: Optional[Assembly] = None) -> CapsuleRegistry:
         """Представить тело деревом капсул (орган = группа, клетка = капсула)."""
-        tier = self.device.tier
+        tier = self.device
         active_keys = {c.key for c in assembly.active} if assembly else set()
         root = Capsule("Протей", Level.BODY, 0, {"ядро"})
         for g in Group:
@@ -263,8 +263,8 @@ class ProteusBody:
     # -------------------------------------------------------------- отчёты
     def inventory(self) -> str:
         """Сводная таблица каталога — как в спецификации."""
-        tier = self.device.tier
-        lines = [f"Каталог капсул Протея на «{self.device.name}» [{tier}]",
+        tier = self.device
+        lines = [f"Каталог капсул Протея на «{self.device.name}» [{self.device.tier}]",
                  f"{'группа':<14}{'капсул':>7}{'влезает':>9}{'параметров':>14}"]
         total = fit_total = 0
         for g in Group:

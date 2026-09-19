@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -76,22 +77,46 @@ class CapsuleSpec:
     notes: str = ""
 
     # ------------------------------------------------------------- размеры
-    def params_for(self, tier: str) -> int:
-        """Сколько параметров капсула возьмёт на данном классе железа.
+    #: опорные точки шкалы роста: RAM -> позиция 0..1 внутри диапазона капсулы
+    _RAM_LO = 32 * 1024 ** 2          # 32 МБ  -> минимальный размер
+    _RAM_HI = 512 * 1024 ** 3         # 512 ГБ -> максимальный размер
 
-        Слабое железо получает нижнюю границу диапазона, мощное — верхнюю.
+    def params_for(self, tier_or_device=None, ram_bytes: Optional[int] = None) -> int:
+        """Сколько параметров капсула возьмёт на конкретном железе.
+
+        Размер тянется за РЕАЛЬНОЙ памятью, а не за ярлыком класса: иначе
+        Smart TV с 4 ГБ и рабочий ноутбук с 32 ГБ получали бы одинаковые
+        капсулы. Шкала логарифмическая — размеры растут на порядки.
         """
+        tier, ram = self._resolve(tier_or_device, ram_bytes)
         if tier_rank(tier) < tier_rank(self.min_tier):
             return 0
-        span = tier_rank("datacenter") - tier_rank(self.min_tier)
-        pos = tier_rank(tier) - tier_rank(self.min_tier)
-        frac = 0.0 if span <= 0 else pos / span
+        if ram and self.min_ram and ram < self.min_ram:
+            return 0
         lo, hi = float(self.min_params), float(self.max_params)
-        # геометрическая интерполяция: размеры растут на порядки, не линейно
-        return int(round(lo * (hi / lo) ** frac))
+        if ram is None:                      # известен только класс железа
+            span = tier_rank("datacenter") - tier_rank(self.min_tier)
+            pos = tier_rank(tier) - tier_rank(self.min_tier)
+            frac = 0.0 if span <= 0 else pos / span
+        else:
+            lo_r, hi_r = float(self._RAM_LO), float(self._RAM_HI)
+            r = min(max(float(ram), lo_r), hi_r)
+            frac = math.log(r / lo_r) / math.log(hi_r / lo_r)
+        return int(round(lo * (hi / lo) ** float(np.clip(frac, 0.0, 1.0))))
 
-    def bytes_for(self, tier: str, bits: float = 2.0) -> int:
-        return int(self.params_for(tier) * bits / 8)
+    @staticmethod
+    def _resolve(tier_or_device, ram_bytes):
+        """Принимаем и строку-класс, и Device, и DeviceState — так удобнее."""
+        if tier_or_device is None:
+            return "medium", ram_bytes
+        if isinstance(tier_or_device, str):
+            return tier_or_device, ram_bytes
+        dev = getattr(tier_or_device, "device", tier_or_device)
+        return dev.tier, (ram_bytes if ram_bytes is not None else dev.ram_bytes)
+
+    def bytes_for(self, tier_or_device=None, bits: float = 2.0,
+                  ram_bytes: Optional[int] = None) -> int:
+        return int(self.params_for(tier_or_device, ram_bytes) * bits / 8)
 
     def fits_on(self, device: Device) -> bool:
         """Влезает ли капсула на устройство: и по классу, и по объёму RAM."""
