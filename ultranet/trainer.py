@@ -10,6 +10,7 @@ from .data import DataLoader
 from .functional import accuracy, cross_entropy
 from .nn import Module
 from .optim import EMA, Optimizer
+from .checkpoint import load_checkpoint, save_checkpoint
 from .tensor import Tensor, no_grad
 
 
@@ -121,7 +122,9 @@ class Trainer:
                 self.best_score, bad = score, 0
                 best_state = self.model.state_dict()
                 if self.checkpoint_path:
-                    self.model.save(self.checkpoint_path)
+                    save_checkpoint(self.checkpoint_path, self.model, self.opt,
+                                    epoch=ep, step=self.opt.t, history=self.history,
+                                    best_score=self.best_score)
             else:
                 bad += 1
 
@@ -139,6 +142,14 @@ class Trainer:
                 break
 
         return self.history
+
+    def resume(self, path: str) -> int:
+        """Продолжить обучение из чекпоинта; возвращает номер эпохи."""
+        ck = load_checkpoint(path, self.model, self.opt)
+        if ck.get("history"):
+            self.history = ck["history"]
+        self.best_score = ck.get("extra", {}).get("best_score", np.inf)
+        return int(ck.get("epoch", 0))
 
     def stop(self) -> None:
         """Прервать обучение из коллбэка."""

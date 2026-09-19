@@ -581,3 +581,273 @@ def test_benchmark_timeit_helper():
     from ultranet.benchmark import timeit
     ms = timeit(lambda: np.zeros((10, 10)), n=3, warmup=1)
     assert ms >= 0
+
+
+# ======================================================================
+#              Тесты v3: корректность оптимизаций ядра
+# ======================================================================
+
+def test_no_grad_buffer_aliasing():
+    """copy-on-write в _accum не должен связывать градиенты разных тензоров."""
+    a = Tensor(np.ones((2, 2)), requires_grad=True)
+    b = Tensor(np.ones((2, 2)), requires_grad=True)
+    (a + b).sum().backward()
+    assert np.allclose(a.grad, 1.0) and np.allclose(b.grad, 1.0)
+    a.grad += 100.0              # мутируем градиент одного
+    assert np.allclose(b.grad, 1.0), "градиент b пострадал от алиасинга"
+
+
+def test_shared_node_accumulates_twice():
+    x = Tensor(np.array([2.0, 3.0]), requires_grad=True)
+    (x * x).sum().backward()     # d/dx x^2 = 2x
+    assert np.allclose(x.grad, [4.0, 6.0])
+
+
+def test_repeated_backward_accumulates():
+    x = Tensor(np.array([1.0, 2.0]), requires_grad=True)
+    (x * 3).sum().backward()
+    (x * 3).sum().backward()
+    assert np.allclose(x.grad, [6.0, 6.0]), "градиенты должны складываться"
+
+
+def test_clip_grad_norm_does_not_corrupt_shared_buffer():
+    m = un.MLP([4, 8, 2])
+    x, y = np.random.randn(6, 4).astype(np.float32), np.random.randint(0, 2, 6)
+    opt = un.Adam(m.parameters(), lr=1e-3)
+    un.cross_entropy(m(Tensor(x)), y).backward()
+    before = [p.grad.copy() for p in m.parameters()]
+    total = opt.clip_grad_norm(1e9)      # порог заведомо не срабатывает
+    assert total > 0
+    for p, b in zip(m.parameters(), before):
+        assert np.allclose(p.grad, b)
+
+
+def test_basic_index_grad_matches_fancy():
+    """Быстрый путь для срезов даёт тот же градиент, что и np.add.at."""
+    x = Tensor(np.random.randn(4, 6), requires_grad=True)
+    check(lambda: (x[:, 2:5] ** 2).sum(), x)
+    check(lambda: (x[1] * 3).sum(), x)
+    check(lambda: (x[..., 0] ** 2).sum(), x)
+
+
+def test_fancy_index_still_accumulates():
+    x = Tensor(np.array([1.0, 2.0, 3.0]), requires_grad=True)
+    x[np.array([0, 0, 2])].sum().backward()
+    assert np.allclose(x.grad, [2.0, 0.0, 1.0]), "повторные индексы должны суммироваться"
+
+
+def test_attention_qkv_split_correct():
+    """Reshape-split q/k/v эквивалентен раздельным срезам."""
+    attn = nn.MultiHeadAttention(16, 4, causal=True).eval()
+    x = Tensor(np.random.randn(2, 5, 16).astype(np.float32))
+    b, t, c = x.shape
+    qkv = attn.qkv(x)
+    fast = qkv.reshape(b, t, 3, attn.n_heads, attn.head_dim).transpose(2, 0, 3, 1, 4)
+    slow_q = qkv[:, :, :c].reshape(b, t, attn.n_heads, attn.head_dim).transpose(0, 2, 1, 3)
+    assert np.allclose(fast.data[0], slow_q.data, atol=1e-6)
+
+
+# ======================================================================
+#          Тесты v3: воспроизводимость, BPE, чекпоинты, gradcheck
+# ======================================================================
+
+def test_manual_seed_full_reproducibility():
+    un.manual_seed(123)
+    m1 = un.MLP([4, 16, 3], dropout=0.3)
+    x = np.random.randn(8, 4).astype(np.float32)
+    out1 = m1(Tensor(x)).data
+
+    un.manual_seed(123)
+    m2 = un.MLP([4, 16, 3], dropout=0.3)
+    x2 = np.random.randn(8, 4).astype(np.float32)
+    out2 = m2(Tensor(x2)).data
+    assert np.allclose(out1, out2), "manual_seed должен давать полный детерминизм"
+
+
+def test_manual_seed_dropout_deterministic():
+    un.manual_seed(5)
+    a = Tensor(np.ones((6, 6))).dropout(0.5, training=True).data
+    un.manual_seed(5)
+    b = Tensor(np.ones((6, 6))).dropout(0.5, training=True).data
+    assert np.allclose(a, b)
+
+
+def test_full_training_run_reproducible():
+    def run():
+        un.manual_seed(77)
+        x, y = un.make_moons(200, seed=0)
+        m = un.MLP([2, 16, 2], dropout=0.1)
+        tr = un.Trainer(m, un.Adam(m.parameters(), lr=1e-2), verbose=False)
+        tr.fit(un.DataLoader(x, y, 32, shuffle=False), epochs=3)
+        return tr.history["loss"]
+
+    assert np.allclose(run(), run()), "весь цикл обучения должен воспроизводиться"
+
+
+# ---------------------------------------------------------------- BPE
+def test_bpe_roundtrip_and_compression():
+    text = "нейронная сеть учится на данных. " * 30
+    tok = un.BPETokenizer.train(text, vocab_size=400)
+    assert tok.vocab_size > 256
+    s = "нейронная сеть"
+    assert tok.decode(tok.encode(s)) == s
+    assert tok.compression_ratio(text) > 2.0
+
+
+def test_bpe_handles_arbitrary_unicode():
+    tok = un.BPETokenizer.train("abc abc abc", vocab_size=300)
+    for s in ["日本語", "🚀 emoji", "ø ñ ü", ""]:
+        assert tok.decode(tok.encode(s)) == s
+
+
+def test_bpe_save_load(tmp_path):
+    tok = un.BPETokenizer.train("привет мир привет мир " * 20, vocab_size=320)
+    p = tmp_path / "bpe.json"
+    tok.save(str(p))
+    tok2 = un.BPETokenizer.load(str(p))
+    s = "привет мир"
+    assert tok2.encode(s) == tok.encode(s) and tok2.decode(tok2.encode(s)) == s
+
+
+def test_bpe_trains_gpt():
+    text = "модель учится на данных. " * 40
+    tok = un.BPETokenizer.train(text, vocab_size=280)  # умеренное сжатие
+    ids = tok.encode(text)
+    assert len(ids) > 40, f"ожидали достаточно токенов, получили {len(ids)}"
+    cfg = un.GPTConfig(vocab_size=tok.vocab_size, block_size=8, n_layer=2, n_head=2, n_embd=32)
+    m = un.GPT(cfg)
+    opt = un.AdamW(m.parameters(), lr=3e-3)
+    first = last = None
+    for _ in range(60):
+        xb, yb = un.make_lm_batches(ids, 8, 8)
+        loss = un.cross_entropy(m(xb), yb)
+        opt.zero_grad(); loss.backward(); opt.step()
+        first = first if first is not None else loss.item()
+        last = loss.item()
+    assert last < first
+
+
+def test_make_lm_batches_clear_error_on_short_data():
+    with pytest.raises(ValueError, match="слишком мало"):
+        un.make_lm_batches([1, 2, 3], block_size=32, batch_size=4)
+
+
+# ------------------------------------------------------- чекпоинты
+def test_checkpoint_restores_optimizer_state(tmp_path):
+    un.manual_seed(1)
+    m = un.MLP([4, 8, 2])
+    opt = un.Adam(m.parameters(), lr=1e-3)
+    x, y = np.random.randn(6, 4).astype(np.float32), np.random.randint(0, 2, 6)
+    for _ in range(3):
+        opt.zero_grad()
+        un.cross_entropy(m(Tensor(x)), y).backward()
+        opt.step()
+
+    p = tmp_path / "ck.pkl"
+    un.save_checkpoint(str(p), m, opt, epoch=2, step=opt.t, history={"loss": [0.5]})
+
+    m2 = un.MLP([4, 8, 2])
+    opt2 = un.Adam(m2.parameters(), lr=99.0)
+    ck = un.load_checkpoint(str(p), m2, opt2)
+    assert ck["epoch"] == 2 and ck["history"]["loss"] == [0.5]
+    assert opt2.lr == 1e-3 and opt2.t == opt.t
+    assert all(np.allclose(a.data, b.data) for a, b in zip(m.parameters(), m2.parameters()))
+    assert all(np.allclose(a, b) for a, b in zip(opt.m, opt2.m))
+
+
+def test_checkpoint_strict_detects_mismatch(tmp_path):
+    p = tmp_path / "c.pkl"
+    un.save_checkpoint(str(p), un.MLP([4, 8, 2]))
+    with pytest.raises(ValueError):
+        un.load_checkpoint(str(p), un.MLP([4, 16, 2]))
+
+
+def test_checkpoint_rejects_wrong_optimizer(tmp_path):
+    m = un.MLP([4, 8, 2])
+    p = tmp_path / "c.pkl"
+    un.save_checkpoint(str(p), m, un.Adam(m.parameters()))
+    with pytest.raises(ValueError):
+        un.load_checkpoint(str(p), m, un.SGD(m.parameters()))
+
+
+def test_trainer_resume_continues_training(tmp_path):
+    un.manual_seed(3)
+    x, y = un.make_moons(200, seed=1)
+    loader = un.DataLoader(x, y, 32, shuffle=False)
+    ck = tmp_path / "best.pkl"
+
+    m = un.MLP([2, 16, 2])
+    tr = un.Trainer(m, un.Adam(m.parameters(), lr=5e-3), verbose=False,
+                    checkpoint_path=str(ck))
+    tr.fit(loader, epochs=3)
+    assert ck.exists()
+
+    m2 = un.MLP([2, 16, 2])
+    tr2 = un.Trainer(m2, un.Adam(m2.parameters(), lr=5e-3), verbose=False)
+    epoch = tr2.resume(str(ck))
+    assert epoch >= 1 and len(tr2.history["loss"]) >= 1
+    hist = tr2.fit(loader, epochs=2)
+    assert len(hist["loss"]) >= 3   # история продолжилась, а не началась заново
+
+
+# ------------------------------------------------------- gradcheck API
+def test_public_gradcheck_passes_and_detects_bug():
+    un.manual_seed(0)
+    lin = nn.Linear(4, 3)
+    x = Tensor(np.random.randn(2, 4), requires_grad=True)
+    assert un.gradcheck(lambda: lin(x).sum(), [x, lin.weight, lin.bias])
+
+    # слой с намеренно неверным backward должен быть пойман
+    bad = Tensor(np.random.randn(3, 3), requires_grad=True)
+
+    def broken():
+        out = bad._make(bad.data * 2.0, (bad,), "broken")
+        out._backward = lambda: bad._accum(np.ones_like(bad.data) * 5.0)  # неверно: должно быть 2
+        return out.sum()
+
+    with pytest.raises(AssertionError):
+        un.gradcheck(broken, [bad])
+
+
+def test_numeric_grad_matches_known_derivative():
+    x = Tensor(np.array([[2.0, 3.0]]), requires_grad=True)
+    g = un.numeric_grad(lambda: (x ** 2).sum(), x)
+    assert np.allclose(g, [[4.0, 6.0]], atol=1e-2)
+
+
+# ======================================================================
+#              Тесты v3: понятные ошибки и инспекция модели
+# ======================================================================
+
+def test_linear_shape_error_is_helpful():
+    with pytest.raises(ValueError, match="Linear.*последней размерностью 4"):
+        nn.Linear(4, 3)(Tensor(np.random.randn(2, 7)))
+
+
+def test_embedding_out_of_range_error():
+    with pytest.raises(IndexError, match=r"Embedding.*\[0, 9\]"):
+        nn.Embedding(10, 4)(np.array([[99]]))
+
+
+def test_gpt_accepts_1d_sequence():
+    m = un.GPT(un.GPTConfig(vocab_size=10, block_size=8, n_layer=1, n_head=2, n_embd=16))
+    assert m(np.array([1, 2, 3])).shape == (1, 3, 10)
+
+
+def test_gpt_rejects_3d_input():
+    m = un.GPT(un.GPTConfig(vocab_size=10, block_size=8, n_layer=1, n_head=2, n_embd=16))
+    with pytest.raises(ValueError, match=r"\(batch, seq\)"):
+        m(np.zeros((2, 3, 4), dtype=int))
+
+
+def test_attention_head_divisibility_error():
+    with pytest.raises(AssertionError, match="делиться"):
+        nn.MultiHeadAttention(10, 4)
+
+
+def test_model_summary_reports_totals():
+    m = un.MLP([4, 8, 2])
+    s = m.summary()
+    assert "ИТОГО" in s and "память" in s
+    total = sum(p.size for p in m.parameters())
+    assert f"{total:,}" in s

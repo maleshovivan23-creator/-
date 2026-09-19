@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 import numpy as np
 
-from .tensor import Tensor, cat
+from .tensor import Tensor, cat, get_rng
 
 
 class Parameter(Tensor):
@@ -19,12 +19,12 @@ class Parameter(Tensor):
 
 # ------------------------------------------------------------------ инициализация
 def kaiming(fan_in: int, fan_out: int, gain: float = 2.0) -> np.ndarray:
-    return (np.random.randn(fan_in, fan_out) * math.sqrt(gain / fan_in)).astype(np.float32)
+    return (get_rng().standard_normal((fan_in, fan_out)) * math.sqrt(gain / fan_in)).astype(np.float32)
 
 
 def xavier(fan_in: int, fan_out: int) -> np.ndarray:
     limit = math.sqrt(6.0 / (fan_in + fan_out))
-    return np.random.uniform(-limit, limit, (fan_in, fan_out)).astype(np.float32)
+    return get_rng().uniform(-limit, limit, (fan_in, fan_out)).astype(np.float32)
 
 
 class Module:
@@ -90,6 +90,23 @@ class Module:
         with open(path, "rb") as f:
             self.load_state_dict(pickle.load(f))
 
+    def summary(self, max_rows: int = 40) -> str:
+        """Таблица параметров модели — быстрый аудит архитектуры."""
+        rows = [(name, tuple(p.shape), p.size) for name, p in self.named_parameters()]
+        total = sum(r[2] for r in rows)
+        w = max([len(r[0]) for r in rows] + [9])
+        head = f"{'параметр'.ljust(w)}  {'форма':<18} {'кол-во':>12}"
+        lines = [head, "-" * len(head)]
+        for name, shape, size in rows[:max_rows]:
+            lines.append(f"{name.ljust(w)}  {str(shape):<18} {size:>12,}")
+        if len(rows) > max_rows:
+            lines.append(f"... ещё {len(rows) - max_rows} параметров")
+        lines.append("-" * len(head))
+        lines.append(f"{'ИТОГО'.ljust(w)}  {'':<18} {total:>12,}")
+        mb = total * 4 / 1024 ** 2
+        lines.append(f"{'память (float32)'.ljust(w)}  {'':<18} {mb:>11.2f}M")
+        return "\n".join(lines)
+
     def forward(self, *a, **kw):  # pragma: no cover - абстрактный
         raise NotImplementedError
 
@@ -105,6 +122,11 @@ class Linear(Module):
         self.bias = Parameter(np.zeros(out_features, dtype=np.float32)) if bias else None
 
     def forward(self, x: Tensor) -> Tensor:
+        if x.shape[-1] != self.weight.shape[0]:
+            raise ValueError(
+                f"Linear: ожидался вход с последней размерностью {self.weight.shape[0]}, "
+                f"получен тензор {x.shape}. Проверьте in_features слоя."
+            )
         out = x @ self.weight
         return out + self.bias if self.bias is not None else out
 
@@ -112,10 +134,19 @@ class Linear(Module):
 class Embedding(Module):
     def __init__(self, num_embeddings: int, dim: int) -> None:
         super().__init__()
-        self.weight = Parameter(np.random.randn(num_embeddings, dim).astype(np.float32) * 0.02)
+        self.weight = Parameter(get_rng().standard_normal((num_embeddings, dim)).astype(np.float32) * 0.02)
 
     def forward(self, idx) -> Tensor:
         idx = np.asarray(idx.data if isinstance(idx, Tensor) else idx).astype(int)
+        if idx.size:
+            lo, hi = int(idx.min()), int(idx.max())
+            n = self.weight.shape[0]
+            if lo < 0 or hi >= n:
+                raise IndexError(
+                    f"Embedding: индексы должны быть в [0, {n - 1}], "
+                    f"получен диапазон [{lo}, {hi}]. Увеличьте num_embeddings "
+                    f"или проверьте словарь токенизатора."
+                )
         return self.weight[idx]
 
 
@@ -263,7 +294,7 @@ class Conv2d(Module):
         self.in_ch, self.out_ch = in_ch, out_ch
         self.k, self.stride, self.pad = kernel_size, stride, padding
         fan_in = in_ch * kernel_size * kernel_size
-        self.weight = Parameter(np.random.randn(out_ch, fan_in).astype(np.float32) * math.sqrt(2.0 / fan_in))
+        self.weight = Parameter(get_rng().standard_normal((out_ch, fan_in)).astype(np.float32) * math.sqrt(2.0 / fan_in))
         self.bias = Parameter(np.zeros(out_ch, dtype=np.float32)) if bias else None
 
     def forward(self, x: Tensor) -> Tensor:
@@ -405,10 +436,9 @@ class MultiHeadAttention(Module):
 
     def forward(self, x: Tensor, use_cache: bool = False) -> Tensor:
         b, t, c = x.shape
-        qkv = self.qkv(x)
-        q = qkv[:, :, :c].reshape(b, t, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = qkv[:, :, c:2 * c].reshape(b, t, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = qkv[:, :, 2 * c:].reshape(b, t, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        # один reshape+transpose вместо трёх срезов: (B,T,3C) -> (3,B,H,T,hd)
+        qkv = self.qkv(x).reshape(b, t, 3, self.n_heads, self.head_dim).transpose(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
         offset = self._cache[0].shape[2] if (use_cache and self._cache is not None) else 0
         if self.rope is not None:

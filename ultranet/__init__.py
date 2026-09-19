@@ -3,7 +3,7 @@
 Собственный автоград, современные слои (RoPE, RMSNorm, SwiGLU, MHA с KV-кэшем),
 оптимизаторы (AdamW, Lion, Lookahead, EMA), тренер и модели вплоть до GPT.
 """
-from . import data, functional, models, nn, optim
+from . import checkpoint, data, functional, models, nn, optim, tokenizer
 from .data import (
     CharTokenizer,
     DataLoader,
@@ -46,14 +46,29 @@ from .optim import (
     RMSprop,
     StepLR,
 )
-from .tensor import Tensor, cat, no_grad, ones, randn, stack, tensor, zeros
+from .tensor import (
+    Tensor,
+    cat,
+    get_rng,
+    manual_seed,
+    no_grad,
+    ones,
+    randn,
+    stack,
+    tensor,
+    zeros,
+)
+from .checkpoint import load_checkpoint, save_checkpoint
+from .gradcheck import gradcheck, numeric_grad
+from .tokenizer import BPETokenizer
 from .trainer import Trainer
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 
 __all__ = [
     # ядро
     "Tensor", "tensor", "zeros", "ones", "randn", "stack", "cat", "no_grad",
+    "manual_seed", "get_rng",
     # пакеты
     "nn", "optim", "data", "functional", "models",
     # модели
@@ -62,7 +77,8 @@ __all__ = [
     "SGD", "Adam", "AdamW", "RMSprop", "Adagrad", "Lion", "Lookahead", "EMA",
     "CosineWarmup", "OneCycleLR", "StepLR", "ReduceLROnPlateau",
     # обучение и данные
-    "Trainer", "DataLoader", "Dataset", "CharTokenizer", "WordTokenizer",
+    "Trainer", "DataLoader", "Dataset", "CharTokenizer", "WordTokenizer", "BPETokenizer",
+    "save_checkpoint", "load_checkpoint", "gradcheck", "numeric_grad",
     "make_spirals", "make_moons", "make_regression", "make_lm_batches",
     "train_test_split", "normalize",
     # потери и метрики

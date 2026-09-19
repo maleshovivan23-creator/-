@@ -168,6 +168,12 @@ class GPT(nn.Module):
 
     def forward(self, idx, use_cache: bool = False, pos_offset: int = 0) -> Tensor:
         idx = np.asarray(idx.data if isinstance(idx, Tensor) else idx).astype(int)
+        if idx.ndim == 1:
+            idx = idx[None]          # удобство: принимаем одиночную последовательность
+        if idx.ndim != 2:
+            raise ValueError(
+                f"GPT ожидает индексы формы (batch, seq) или (seq,), получено {idx.shape}"
+            )
         b, t = idx.shape
         x = self.tok_emb(idx)
         if self.pos_emb is not None:

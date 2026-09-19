@@ -11,6 +11,25 @@ import numpy as np
 
 ArrayLike = Union["Tensor", np.ndarray, float, int, list]
 
+# ------------------------------------------------------------------ случайность
+_RNG = np.random.default_rng()
+
+
+def manual_seed(seed: int) -> None:
+    """Зафиксировать все источники случайности библиотеки (инициализация, dropout).
+
+    >>> un.manual_seed(42)   # два запуска дадут идентичные веса и маски dropout
+    """
+    global _RNG
+    _RNG = np.random.default_rng(seed)
+    np.random.seed(seed)
+
+
+def get_rng() -> np.random.Generator:
+    """Текущий генератор библиотеки (используется слоями и dropout)."""
+    return _RNG
+
+
 # --------------------------------------------------------------- режим градиентов
 _GRAD_ENABLED = True
 
@@ -57,6 +76,15 @@ def _unbroadcast(grad: np.ndarray, shape: Tuple[int, ...]) -> np.ndarray:
         if dim == 1 and grad.shape[i] != 1:
             grad = grad.sum(axis=i, keepdims=True)
     return grad.reshape(shape)
+
+
+def _is_basic_index(idx) -> bool:
+    """True, если индекс — базовый (срезы/int/None/Ellipsis) и не дублирует элементы."""
+    items = idx if isinstance(idx, tuple) else (idx,)
+    for i in items:
+        if not (isinstance(i, (slice, int, np.integer)) or i is Ellipsis or i is None):
+            return False
+    return True
 
 
 class Tensor:
@@ -123,11 +151,29 @@ class Tensor:
         req = _GRAD_ENABLED and any(p.requires_grad for p in parents)
         return Tensor(data, requires_grad=req, _children=parents if req else (), _op=op)
 
-    def _accum(self, g: np.ndarray) -> None:
+    def _accum(self, g: np.ndarray, shared: bool = True) -> None:
+        """Накопить градиент.
+
+        shared=True  — `g` может быть чужим буфером (out.grad или его view),
+                       поэтому при первом присваивании делается копия.
+        shared=False — `g` только что вычислен этой операцией и больше нигде
+                       не используется, копию можно не делать (быстрый путь).
+        """
         if not self.requires_grad:
             return
-        g = _unbroadcast(np.asarray(g, dtype=np.float32), self.shape)
-        self.grad = g if self.grad is None else self.grad + g
+        # быстрый путь: форма уже совпадает (самый частый случай)
+        if type(g) is np.ndarray and g.shape == self.data.shape:
+            if g.dtype != np.float32:
+                g = g.astype(np.float32, copy=False)
+        else:
+            g = _unbroadcast(np.asarray(g, dtype=np.float32), self.shape)
+        if self.grad is None:
+            # Копия обязательна: некоторые _backward отдают out.grad (или его view)
+            # сразу нескольким родителям — без копии градиенты «слипнутся»,
+            # и внешняя запись вида `p.grad *= s` повредит чужой тензор.
+            self.grad = g.copy() if shared else g
+        else:
+            self.grad += g  # in-place: накопление без лишней аллокации
 
     # ------------------------------------------------------------- арифметика
     def __add__(self, other: ArrayLike) -> "Tensor":
@@ -146,8 +192,8 @@ class Tensor:
         out = self._make(self.data * other.data, (self, other), "*")
 
         def _backward() -> None:
-            self._accum(out.grad * other.data)
-            other._accum(out.grad * self.data)
+            self._accum(out.grad * other.data, shared=False)
+            other._accum(out.grad * self.data, shared=False)
 
         out._backward = _backward
         return out
@@ -156,7 +202,7 @@ class Tensor:
         out = self._make(self.data ** p, (self,), f"**{p}")
 
         def _backward() -> None:
-            self._accum(out.grad * p * self.data ** (p - 1))
+            self._accum(out.grad * p * self.data ** (p - 1), shared=False)
 
         out._backward = _backward
         return out
@@ -171,8 +217,8 @@ class Tensor:
             ga = g @ np.swapaxes(b, -1, -2)
             gb = np.swapaxes(a, -1, -2) @ g
             # батчевый matmul может размножить оси -> сворачиваем
-            self._accum(_unbroadcast(ga, a.shape))
-            other._accum(_unbroadcast(gb, b.shape))
+            self._accum(_unbroadcast(ga, a.shape), shared=False)
+            other._accum(_unbroadcast(gb, b.shape), shared=False)
 
         out._backward = _backward
         return out
@@ -203,11 +249,18 @@ class Tensor:
 
     def __getitem__(self, idx) -> "Tensor":
         out = self._make(self.data[idx], (self,), "getitem")
+        # Базовая индексация (срезы/int/Ellipsis) не может повторять элементы,
+        # поэтому градиент пишется прямым присваиванием — np.add.at на порядок медленнее
+        # и нужен только для «фантазийной» индексации массивами.
+        basic = _is_basic_index(idx)
 
         def _backward() -> None:
             g = np.zeros_like(self.data)
-            np.add.at(g, idx, out.grad)
-            self._accum(g)
+            if basic:
+                g[idx] = out.grad
+            else:
+                np.add.at(g, idx, out.grad)
+            self._accum(g, shared=False)
 
         out._backward = _backward
         return out
@@ -256,7 +309,7 @@ class Tensor:
             g = out.grad
             if axis is not None and not keepdims:
                 g = np.expand_dims(g, axis)
-            self._accum(np.broadcast_to(g, self.shape).copy())
+            self._accum(np.broadcast_to(g, self.shape).copy(), shared=False)
 
         out._backward = _backward
         return out
@@ -280,7 +333,7 @@ class Tensor:
             g = out.grad
             if axis is not None and not keepdims:
                 g = np.expand_dims(g, axis)
-            self._accum(mask * g)
+            self._accum(mask * g, shared=False)
 
         out._backward = _backward
         return out
@@ -290,7 +343,7 @@ class Tensor:
         out = self._make(np.exp(self.data), (self,), "exp")
 
         def _backward() -> None:
-            self._accum(out.grad * out.data)
+            self._accum(out.grad * out.data, shared=False)
 
         out._backward = _backward
         return out
@@ -299,7 +352,7 @@ class Tensor:
         out = self._make(np.log(np.clip(self.data, 1e-12, None)), (self,), "log")
 
         def _backward() -> None:
-            self._accum(out.grad / np.clip(self.data, 1e-12, None))
+            self._accum(out.grad / np.clip(self.data, 1e-12, None), shared=False)
 
         out._backward = _backward
         return out
@@ -311,7 +364,7 @@ class Tensor:
         out = self._make(np.maximum(self.data, 0.0), (self,), "relu")
 
         def _backward() -> None:
-            self._accum(out.grad * (self.data > 0))
+            self._accum(out.grad * (self.data > 0), shared=False)
 
         out._backward = _backward
         return out
@@ -320,7 +373,7 @@ class Tensor:
         out = self._make(np.where(self.data > 0, self.data, slope * self.data), (self,), "leaky_relu")
 
         def _backward() -> None:
-            self._accum(out.grad * np.where(self.data > 0, 1.0, slope))
+            self._accum(out.grad * np.where(self.data > 0, 1.0, slope), shared=False)
 
         out._backward = _backward
         return out
@@ -330,7 +383,7 @@ class Tensor:
         out = self._make(t, (self,), "tanh")
 
         def _backward() -> None:
-            self._accum(out.grad * (1 - t * t))
+            self._accum(out.grad * (1 - t * t), shared=False)
 
         out._backward = _backward
         return out
@@ -340,7 +393,7 @@ class Tensor:
         out = self._make(s, (self,), "sigmoid")
 
         def _backward() -> None:
-            self._accum(out.grad * s * (1 - s))
+            self._accum(out.grad * s * (1 - s), shared=False)
 
         out._backward = _backward
         return out
@@ -357,7 +410,7 @@ class Tensor:
         def _backward() -> None:
             dinner = c * (1 + 3 * 0.044715 * x ** 2)
             d = 0.5 * (1 + t) + 0.5 * x * (1 - t * t) * dinner
-            self._accum(out.grad * d)
+            self._accum(out.grad * d, shared=False)
 
         out._backward = _backward
         return out
@@ -371,7 +424,7 @@ class Tensor:
 
         def _backward() -> None:
             g = out.grad
-            self._accum(p * (g - (g * p).sum(axis=axis, keepdims=True)))
+            self._accum(p * (g - (g * p).sum(axis=axis, keepdims=True)), shared=False)
 
         out._backward = _backward
         return out
@@ -386,7 +439,7 @@ class Tensor:
 
         def _backward() -> None:
             g = out.grad
-            self._accum(g - p * g.sum(axis=axis, keepdims=True))
+            self._accum(g - p * g.sum(axis=axis, keepdims=True), shared=False)
 
         out._backward = _backward
         return out
@@ -397,7 +450,7 @@ class Tensor:
         out = self._make(self.data * s, (self,), "silu")
 
         def _backward() -> None:
-            self._accum(out.grad * (s * (1 + self.data * (1 - s))))
+            self._accum(out.grad * (s * (1 + self.data * (1 - s))), shared=False)
 
         out._backward = _backward
         return out
@@ -406,7 +459,7 @@ class Tensor:
         out = self._make(np.abs(self.data), (self,), "abs")
 
         def _backward() -> None:
-            self._accum(out.grad * np.sign(self.data))
+            self._accum(out.grad * np.sign(self.data), shared=False)
 
         out._backward = _backward
         return out
@@ -415,7 +468,7 @@ class Tensor:
         out = self._make(np.sin(self.data), (self,), "sin")
 
         def _backward() -> None:
-            self._accum(out.grad * np.cos(self.data))
+            self._accum(out.grad * np.cos(self.data), shared=False)
 
         out._backward = _backward
         return out
@@ -424,7 +477,7 @@ class Tensor:
         out = self._make(np.cos(self.data), (self,), "cos")
 
         def _backward() -> None:
-            self._accum(-out.grad * np.sin(self.data))
+            self._accum(-out.grad * np.sin(self.data), shared=False)
 
         out._backward = _backward
         return out
@@ -435,7 +488,7 @@ class Tensor:
         out = self._make(np.where(mask, value, self.data), (self,), "masked_fill")
 
         def _backward() -> None:
-            self._accum(out.grad * keep)
+            self._accum(out.grad * keep, shared=False)
 
         out._backward = _backward
         return out
@@ -443,11 +496,11 @@ class Tensor:
     def dropout(self, p: float, training: bool = True) -> "Tensor":
         if p <= 0.0 or not training:
             return self
-        keep = (np.random.rand(*self.shape) >= p).astype(np.float32) / (1.0 - p)
+        keep = (_RNG.random(self.shape) >= p).astype(np.float32) / (1.0 - p)
         out = self._make(self.data * keep, (self,), "dropout")
 
         def _backward() -> None:
-            self._accum(out.grad * keep)
+            self._accum(out.grad * keep, shared=False)
 
         out._backward = _backward
         return out
@@ -457,7 +510,7 @@ class Tensor:
         inside = ((self.data >= lo) & (self.data <= hi)).astype(np.float32)
 
         def _backward() -> None:
-            self._accum(out.grad * inside)
+            self._accum(out.grad * inside, shared=False)
 
         out._backward = _backward
         return out
@@ -507,7 +560,7 @@ def ones(*shape: int, requires_grad: bool = False) -> Tensor:
 
 
 def randn(*shape: int, requires_grad: bool = False) -> Tensor:
-    return Tensor(np.random.randn(*shape).astype(np.float32), requires_grad=requires_grad)
+    return Tensor(_RNG.standard_normal(shape).astype(np.float32), requires_grad=requires_grad)
 
 
 def arange(n: int) -> Tensor:

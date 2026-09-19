@@ -154,6 +154,11 @@ def make_lm_batches(ids: List[int], block_size: int, batch_size: int, seed: Opti
     """Случайные окна (x, y) со сдвигом на один токен."""
     rng = np.random.default_rng(seed)
     arr = np.asarray(ids, dtype=int)
+    if len(arr) < block_size + 2:
+        raise ValueError(
+            f"данных слишком мало: {len(arr)} токенов при block_size={block_size}. "
+            f"Нужно минимум {block_size + 2} — уменьшите block_size или возьмите больше текста."
+        )
     ix = rng.integers(0, len(arr) - block_size - 1, batch_size)
     x = np.stack([arr[i:i + block_size] for i in ix])
     y = np.stack([arr[i + 1:i + 1 + block_size] for i in ix])
