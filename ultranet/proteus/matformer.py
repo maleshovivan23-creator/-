@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -35,6 +35,8 @@ class MatConfig:
     dropout: float = 0.0
     widths: Tuple[float, ...] = (0.25, 0.5, 1.0)   # обучаемые срезы
     exit_layers: Tuple[int, ...] = ()              # индексы слоёв с ранним выходом
+    n_experts: int = 0            # 0 = обычный MLP; >1 включает MoE
+    top_k_experts: int = 2        # сколько экспертов активно на токен
 
     @property
     def n_head(self) -> int:
@@ -77,7 +79,8 @@ class ElasticLinear(nn.Module):
 class MatBlock(nn.Module):
     """Блок трансформера с эластичной шириной (RMSNorm + RoPE + SwiGLU)."""
 
-    def __init__(self, dim: int, head_dim: int, mlp_ratio: int = 4, dropout: float = 0.0) -> None:
+    def __init__(self, dim: int, head_dim: int, mlp_ratio: int = 4, dropout: float = 0.0,
+                 n_experts: int = 0, top_k: int = 2) -> None:
         super().__init__()
         self.dim, self.head_dim = dim, head_dim
         self.mlp_dim = mlp_ratio * dim
@@ -87,13 +90,20 @@ class MatBlock(nn.Module):
         self.wk = ElasticLinear(dim, dim)
         self.wv = ElasticLinear(dim, dim)
         self.wo = ElasticLinear(dim, dim)
-        self.w_gate = ElasticLinear(dim, self.mlp_dim)
-        self.w_up = ElasticLinear(dim, self.mlp_dim)
-        self.w_down = ElasticLinear(self.mlp_dim, dim)
+        self.n_experts = n_experts
+        if n_experts and n_experts > 1:
+            from .experts import MoE
+            self.moe = MoE(dim, n_experts, top_k, mlp_ratio)
+            self.w_gate = self.w_up = self.w_down = None
+        else:
+            self.moe = None
+            self.w_gate = ElasticLinear(dim, self.mlp_dim)
+            self.w_up = ElasticLinear(dim, self.mlp_dim)
+            self.w_down = ElasticLinear(self.mlp_dim, dim)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: Tensor, d_act: int, rope: nn.RotaryEmbedding,
-                offset: int = 0) -> Tensor:
+                offset: int = 0, n_active_experts: Optional[int] = None) -> Tensor:
         b, t, _ = x.shape
         hd = self.head_dim
         n_h = d_act // hd
@@ -110,14 +120,19 @@ class MatBlock(nn.Module):
         y = (att @ v).transpose(0, 2, 1, 3).reshape(b, t, d_act)
         x = x + self.drop(self.wo(y, d_act, d_act))
 
-        m_act = _round_to(self.mlp_dim * d_act // self.dim, 8)
         h2 = _rmsnorm(x, self.g2[:d_act])
+        if self.moe is not None:
+            return x + self.drop(self.moe(h2, d_act, n_active_experts))
+        m_act = _round_to(self.mlp_dim * d_act // self.dim, 8)
         gated = self.w_gate(h2, d_act, m_act).silu() * self.w_up(h2, d_act, m_act)
         return x + self.drop(self.w_down(gated, m_act, d_act))
 
-    def active_params(self, d_act: int) -> int:
+    def active_params(self, d_act: int, n_active_experts: Optional[int] = None) -> int:
+        attn = 4 * d_act * d_act + 2 * d_act
+        if self.moe is not None:
+            return attn + self.moe.active_params(d_act, n_active_experts)
         m_act = _round_to(self.mlp_dim * d_act // self.dim, 8)
-        return (4 * d_act * d_act) + (2 * d_act * m_act) + (m_act * d_act) + 2 * d_act
+        return attn + 3 * d_act * m_act
 
 
 class MatFormer(nn.Module):
@@ -133,7 +148,8 @@ class MatFormer(nn.Module):
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         self.rope = nn.RotaryEmbedding(cfg.head_dim, max_seq=cfg.block_size * 8)
-        self.blocks = [MatBlock(cfg.n_embd, cfg.head_dim, cfg.mlp_ratio, cfg.dropout)
+        self.blocks = [MatBlock(cfg.n_embd, cfg.head_dim, cfg.mlp_ratio, cfg.dropout,
+                                cfg.n_experts, cfg.top_k_experts)
                        for _ in range(cfg.n_layer)]
         for i, b in enumerate(self.blocks):
             self._modules[f"block{i}"] = b
@@ -146,6 +162,9 @@ class MatFormer(nn.Module):
         scale = 1.0 / math.sqrt(2 * cfg.n_layer)
         for blk in self.blocks:
             blk.wo.weight.data *= scale
+        # активные steering-векторы: слой -> (вектор, сила)
+        self._steering: Dict[int, Tuple[np.ndarray, float]] = {}
+        self._n_active_experts: Optional[int] = None
 
     # ------------------------------------------------------------- размерность
     def width_dim(self, width: float) -> int:
@@ -159,8 +178,12 @@ class MatFormer(nn.Module):
         n_layers = self.cfg.n_layer if n_layers is None else n_layers
         total = self.cfg.vocab_size * d + d          # эмбеддинги (голова связана) + норма
         for blk in self.blocks[:n_layers]:
-            total += blk.active_params(d)
+            total += blk.active_params(d, self._n_active_experts)
         return total
+
+    def total_params_dense(self) -> int:
+        """Все параметры, включая спящих экспертов."""
+        return self.num_params()
 
     # ------------------------------------------------- пошаговый API (для роя)
     def embed(self, idx, d_act: int) -> Tensor:
@@ -177,7 +200,32 @@ class MatFormer(nn.Module):
         return self.tok_emb.weight[:, :d_act][idx]
 
     def run_block(self, i: int, x: Tensor, d_act: int, offset: int = 0) -> Tensor:
-        return self.blocks[i](x, d_act, self.rope, offset)
+        x = self.blocks[i](x, d_act, self.rope, offset, self._n_active_experts)
+        sv = self._steering.get(i)
+        if sv is not None:
+            vec, alpha = sv
+            x = x + Tensor(vec[:d_act].astype(np.float32) * alpha)
+        return x
+
+    # ------------------------------------------------------ steering-векторы
+    def set_steering(self, layer: int, vector: np.ndarray, strength: float = 1.0) -> None:
+        """Сдвинуть активации слоя в заданном направлении (без смены весов)."""
+        self._steering[int(layer)] = (np.asarray(vector, dtype=np.float32), float(strength))
+
+    def clear_steering(self) -> None:
+        self._steering = {}
+
+    @property
+    def steering_active(self) -> bool:
+        return bool(self._steering)
+
+    def set_active_experts(self, k: Optional[int]) -> None:
+        """Сколько экспертов активировать (мета-контроллер крутит эту ручку)."""
+        self._n_active_experts = k
+
+    def norm_for_moe(self, x: Tensor, layer: int, d_act: int) -> Tensor:
+        """Нормированный вход MoE слоя — для анализа специализации."""
+        return _rmsnorm(x, self.blocks[layer].g2[:d_act])
 
     def readout(self, x: Tensor, d_act: int, gamma: Optional[Tensor] = None) -> Tensor:
         g = self.g_out[:d_act] if gamma is None else gamma[:d_act]

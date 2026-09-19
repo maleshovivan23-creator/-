@@ -63,7 +63,7 @@ from .gradcheck import gradcheck, numeric_grad
 from .tokenizer import BPETokenizer
 from .trainer import Trainer
 
-__version__ = "4.0.0"
+__version__ = "5.0.0"
 
 __all__ = [
     # ядро

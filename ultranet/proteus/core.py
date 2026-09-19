@@ -12,12 +12,16 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from ..tensor import no_grad
+from .adapt import Feedback, PersonalAdapter
 from .bytes import ByteTokenizer
+from .capsules import CapsuleRegistry
 from .controller import MetaController, Plan
 from .devices import Device, DeviceState, get_device
 from .matformer import MatConfig, MatFormer
 from .memory import LocalMemory
 from .quant import TernaryModel
+from .shards import ShardedSwarm
+from .steering import SteeringLibrary
 from .swarm import Swarm
 
 
@@ -31,6 +35,10 @@ class Response:
     context_used: str = ""
     swarm_hops: int = 0
     stayed_local: bool = True
+    steering: str = ""
+    experts_active: Optional[int] = None
+    capsules_active: float = 1.0
+    adapter_applied: bool = False
 
     def __str__(self) -> str:
         return self.text
@@ -43,6 +51,14 @@ class Response:
         ]
         if self.context_used:
             lines.append(f"  из памяти : {self.context_used[:60]}...")
+        if self.steering:
+            lines.append(f"  вектор    : {self.steering}")
+        if self.experts_active is not None:
+            lines.append(f"  экспертов : {self.experts_active}")
+        if self.capsules_active < 1.0:
+            lines.append(f"  капсул    : {self.capsules_active * 100:.0f}% активно")
+        if self.adapter_applied:
+            lines.append(f"  адаптер   : LoRA применён")
         if self.swarm_hops:
             lines.append(f"  прыжков   : {self.swarm_hops}")
         return "\n".join(lines)
@@ -67,7 +83,12 @@ class Proteus:
         self.controller = MetaController(self.model)
         self.state = DeviceState(get_device(device) if isinstance(device, str) else device)
         self.swarm: Optional[Swarm] = None
+        self.sharded: Optional[ShardedSwarm] = None
         self.cloud_enabled = False        # по умолчанию — никогда
+        self.steering = SteeringLibrary(self.model)
+        self.adapter: Optional[PersonalAdapter] = None
+        self.capsules: Optional[CapsuleRegistry] = None
+        self.task_vectors: Dict[str, str] = {}   # тип задачи -> имя steering-вектора
 
     # ------------------------------------------------------------ конструкторы
     @classmethod
@@ -83,6 +104,43 @@ class Proteus:
                         widths=(0.25, 0.5, 1.0), exit_layers=(2, 5))
         return cls(MatFormer(cfg), **kw)
 
+    @classmethod
+    def with_experts(cls, n_experts: int = 4, top_k: int = 2, **kw) -> "Proteus":
+        """Протей с MoE: разные эксперты для разных задач."""
+        cfg = MatConfig(n_layer=4, n_embd=128, head_dim=32, block_size=64,
+                        widths=(0.25, 0.5, 1.0), exit_layers=(1,),
+                        n_experts=n_experts, top_k_experts=top_k)
+        return cls(MatFormer(cfg), **kw)
+
+    # ------------------------------------------------------------ подсистемы
+    def enable_adapter(self, rank: int = 4) -> PersonalAdapter:
+        """Включить персонализацию (LoRA поверх замороженного ядра)."""
+        self.adapter = PersonalAdapter(self.model, rank=rank)
+        return self.adapter
+
+    def enable_capsules(self, skills_by_expert: Optional[Dict[int, set]] = None
+                        ) -> CapsuleRegistry:
+        self.capsules = CapsuleRegistry.from_model(self.model, skills_by_expert)
+        return self.capsules
+
+    def bind_vector(self, task: str, vector_name: str) -> None:
+        """Связать тип задачи со steering-вектором."""
+        self.task_vectors[task] = vector_name
+
+    @staticmethod
+    def classify_task(prompt: str) -> str:
+        """Первые слои — классификатор задачи (из спецификации, часть 2)."""
+        p = prompt.lower()
+        if any(k in p for k in ("код", "функци", "def ", "class ", "code", "напиши программ")):
+            return "код"
+        if any(k in p for k in ("стих", "поэм", "придумай", "сочини", "poem")):
+            return "творчество"
+        if any(k in p for k in ("посчитай", "сколько будет", "реши", "уравнен", "+", "=")):
+            return "математика"
+        if any(k in p for k in ("почему", "объясни", "проанализируй", "разбер", "why", "explain")):
+            return "рассуждение"
+        return "диалог"
+
     # ------------------------------------------------------------- устройства
     def attach(self, device: str | Device, **state_kw) -> "Proteus":
         """Переехать на устройство (или описать его текущее состояние)."""
@@ -96,8 +154,31 @@ class Proteus:
         self.swarm = Swarm(self.model, states, width=width)
         return self.swarm
 
+    def form_sharded_swarm(self, devices: Sequence[str],
+                           skills_by_layer: Optional[Dict[int, set]] = None,
+                           width: float = 1.0) -> ShardedSwarm:
+        """Рой с шардами, консенсусом и выбором роутера без лидера."""
+        states = [DeviceState(get_device(d)) for d in devices]
+        self.sharded = ShardedSwarm(self.model, states, width=width,
+                                    skills_by_layer=skills_by_layer)
+        return self.sharded
+
     def dissolve_swarm(self) -> None:
         self.swarm = None
+        self.sharded = None
+
+    # ------------------------------------------------------------ обратная связь
+    def feedback(self, prompt: str, reward: float = 1.0) -> None:
+        """Лайк/правка/игнор — сигнал для средней петли адаптации."""
+        if self.adapter is None:
+            self.enable_adapter()
+        self.adapter.observe(Feedback(self.tok.encode(prompt), reward=reward))
+
+    def consolidate(self, steps: int = 20, **kw) -> Dict[str, List[float]]:
+        """Средняя петля: дообучить LoRA на накопленных сигналах."""
+        if self.adapter is None:
+            return {"loss": []}
+        return self.adapter.consolidate(steps=steps, **kw)
 
     # ------------------------------------------------------------------ знание
     def remember(self, *facts: str) -> None:
@@ -113,7 +194,27 @@ class Proteus:
                 use_memory: bool = True, seed: Optional[int] = None) -> Response:
         """Полный цикл: профилирование -> план -> (память) -> генерация."""
         complexity = self.estimate_complexity(prompt) if task_complexity is None else task_complexity
+        task = self.classify_task(prompt)
         plan = self.controller.plan(self.state, complexity)
+
+        # мета-контроллер крутит число экспертов: простая задача — меньше
+        experts_active = None
+        if self.model.cfg.n_experts > 1:
+            experts_active = int(np.clip(
+                round(1 + (self.model.cfg.n_experts - 1) * complexity),
+                1, self.model.cfg.n_experts))
+            self.model.set_active_experts(experts_active)
+
+        # капсулы: просыпаются только нужные
+        capsule_frac = 1.0
+        if self.capsules is not None:
+            self.capsules.assemble([task])
+            capsule_frac = self.capsules.active_fraction()
+
+        # steering: направление мышления под тип задачи
+        steer_name = self.task_vectors.get(task, "")
+        if steer_name and steer_name in self.steering:
+            self.steering.apply(steer_name)
 
         context = ""
         if use_memory and len(self.memory):
@@ -133,9 +234,20 @@ class Proteus:
             hops = 0
 
         text = self.tok.decode(out_ids[len(ids):])
+        if steer_name:
+            self.steering.clear()
+        self.model.set_active_experts(None)
+
+        # быстрая петля: запоминаем взаимодействие для будущей консолидации
+        if self.adapter is not None:
+            self.adapter.observe(Feedback(self.tok.encode(full), reward=0.0, tag=task))
+
         return Response(text=text, plan=plan, layers_used=plan.n_layers,
                         context_used=context, swarm_hops=hops,
-                        stayed_local=not self.cloud_enabled)
+                        stayed_local=not self.cloud_enabled,
+                        steering=steer_name, experts_active=experts_active,
+                        capsules_active=capsule_frac,
+                        adapter_applied=self.adapter is not None)
 
     def _sample_loop(self, ids: List[int], plan: Plan, n: int,
                      temperature: float, top_k: int, seed: Optional[int]) -> List[int]:
