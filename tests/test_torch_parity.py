@@ -133,3 +133,57 @@ class TestNoDoubleCounting:
         moved = np.abs(m.tok_emb.weight.data - before).max()
         # один шаг Adam сдвигает вес примерно на lr, не на 2*lr
         assert moved < 1.5e-2
+
+
+class TestInitialization:
+    """Инициализация с нуля: loss на старте должен быть ln(vocab_size).
+
+    Регрессия: TorchGPT использовал умолчания torch (Embedding N(0,1)
+    вместо N(0,0.02)), из-за чего loss стартовал с ~240 вместо ~8.3.
+    convert_weights это маскировал — веса приходили готовыми, — и баг
+    проявился бы только при обучении с нуля в Colab.
+    """
+
+    @pytest.mark.parametrize("style,name", [(GPT2_STYLE, "gpt2"), (LLAMA_STYLE, "llama")])
+    def test_initial_loss_is_ln_vocab(self, style, name):
+        import math
+        vocab = 4096
+        cfg = GPTConfig(vocab_size=vocab, block_size=128, n_layer=4,
+                        n_head=8, n_embd=256, dropout=0.0, **style)
+        tm = TorchGPT(cfg)
+        tm.eval()
+        g = torch.Generator().manual_seed(0)
+        x = torch.randint(0, vocab, (4, 64), generator=g)
+        y = torch.randint(0, vocab, (4, 64), generator=g)
+        with torch.no_grad():
+            _, loss = tm(x, y)
+        expected = math.log(vocab)
+        assert abs(float(loss) - expected) < 1.0, \
+            f"loss {float(loss):.2f} вместо ~{expected:.2f}"
+
+    def test_embedding_std_matches_reference(self):
+        cfg = GPTConfig(vocab_size=1024, block_size=64, n_layer=2,
+                        n_head=4, n_embd=128, **LLAMA_STYLE)
+        tm = TorchGPT(cfg)
+        assert 0.01 < float(tm.tok_emb.weight.std()) < 0.04
+
+    def test_training_from_scratch_reduces_loss(self):
+        """Старт с правильного масштаба -> обучение идёт сразу."""
+        vocab = 256
+        cfg = GPTConfig(vocab_size=vocab, block_size=32, n_layer=2,
+                        n_head=4, n_embd=64, dropout=0.0, **LLAMA_STYLE)
+        tm = TorchGPT(cfg)
+        opt = torch.optim.AdamW(tm.parameters(), lr=3e-3)
+        g = torch.Generator().manual_seed(0)
+        x = torch.randint(0, 64, (8, 32), generator=g)
+        y = torch.roll(x, -1, dims=1)
+        first = last = None
+        for i in range(60):
+            opt.zero_grad()
+            _, loss = tm(x, y)
+            loss.backward()
+            opt.step()
+            if i == 0:
+                first = float(loss)
+            last = float(loss)
+        assert last < first * 0.5

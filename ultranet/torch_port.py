@@ -174,6 +174,40 @@ class TorchGPT(tnn.Module):
             for _ in range(cfg.n_layer)])
         self.ln_f = RMSNorm(cfg.n_embd) if cfg.norm == "rms" else LayerNorm(cfg.n_embd)
         self.head = None if cfg.tie_weights else tnn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+        self._init_like_reference()
+
+    def _init_like_reference(self) -> None:
+        """Инициализация ровно как в NumPy-референсе.
+
+        Умолчания torch тут не подходят: Embedding он инициализирует
+        как N(0, 1), а референс — N(0, 0.02). При tie_weights эта же
+        матрица работает выходной головой, поэтому логиты на старте
+        получаются в ~50 раз крупнее нужного, и loss стартует с ~240
+        вместо ln(vocab) ≈ 8.3. Такой старт либо расходится, либо
+        тратит первые тысячи шагов на возврат к нормальному масштабу.
+
+        Ошибка не видна при convert_weights (там веса приходят готовыми)
+        и проявляется только при обучении с нуля.
+        """
+        cfg = self.cfg
+        tnn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
+        if self.pos_emb is not None:
+            tnn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.02)
+
+        for m in self.modules():
+            if isinstance(m, tnn.Linear):
+                # kaiming с gain=2.0, как kaiming() в ultranet.nn
+                fan_in = m.weight.shape[1]
+                tnn.init.normal_(m.weight, mean=0.0, std=math.sqrt(2.0 / fan_in))
+                if m.bias is not None:
+                    tnn.init.zeros_(m.bias)
+
+        # масштабированная инициализация остаточных проекций (GPT-2 § 2.3)
+        scale = 1.0 / math.sqrt(2 * cfg.n_layer)
+        for blk in self.blocks:
+            blk.attn.proj.weight.data *= scale
+        if self.head is not None:
+            tnn.init.normal_(self.head.weight, mean=0.0, std=0.02)
 
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None):
         b, t = idx.shape
