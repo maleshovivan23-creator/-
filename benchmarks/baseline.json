@@ -19,7 +19,17 @@
   "cores": 2,
   "numpy": "2.4.6",
   "python": "3.11.2",
-  "blas": "scipy-openblas",
+  "blas": {
+    "name": "scipy-openblas",
+    "version": "0.3.31.188.0",
+    "config": "DYNAMIC_ARCH NO_AFFINITY Haswell MAX_THREADS=64",
+    "cpu_simd_available": [
+      "X86_V3",
+      "X86_V4",
+      "AVX512_ICL"
+    ],
+    "note": "OpenBLAS выбрал ядро Haswell (AVX2), хотя CPU умеет AVX512"
+  },
   "before_optimization": {
     "forward_ms": 109.28,
     "backward_ms": 63.87,
@@ -33,5 +43,73 @@
     "Adam: in-place обновления и переиспользуемый буфер вместо ~50 аллокаций на шаг",
     "matmul backward: reshape вместо батчевого matmul с последующей суммой (x2.6)"
   ],
-  "speedup_vs_before": 1.71
+  "speedup_vs_before": 1.71,
+  "hardware": {
+    "cpu": "Intel Xeon @ 2.60GHz",
+    "sockets_cores_threads": "1 socket / 1 core / 2 threads",
+    "physical_cores": 1,
+    "logical_cpus": 2,
+    "ram_gb": 3,
+    "note": "это песочница CI-класса, а не машина для обучения: 1 физическое ядро + HT, 3 ГБ RAM"
+  },
+  "thread_scaling": {
+    "matmul_1024_gflops": {
+      "1": 114.0,
+      "2": 208.7,
+      "4": 219.9
+    },
+    "full_step_ms": {
+      "1": 129.04,
+      "2": 112.06,
+      "4": 109.25
+    },
+    "conclusion": "по умолчанию уже 2 потока; OMP_NUM_THREADS не даёт бесплатного x1.5 (1->2 это x1.18 на шаге)"
+  },
+  "scaling": [
+    {
+      "params_m": 2.71,
+      "batch": 8,
+      "seq": 64,
+      "n_layer": 4,
+      "n_embd": 128,
+      "step_ms": 149.5,
+      "tokens_per_sec": 3425,
+      "peak_rss_mb": 582
+    },
+    {
+      "params_m": 15.94,
+      "batch": 8,
+      "seq": 128,
+      "n_layer": 6,
+      "n_embd": 256,
+      "step_ms": 833.6,
+      "tokens_per_sec": 1228,
+      "peak_rss_mb": 3375
+    }
+  ],
+  "memory_profile": {
+    "weights_mb": 10.7,
+    "adam_state_mb": 32.2,
+    "graph_mb": 267.4,
+    "peak_step_mb": 606,
+    "note": "граф автограда держит все промежуточные тензоры: 267 МБ при 10.7 МБ весов",
+    "by_op_mb": {
+      "matmul": 60.8,
+      "add": 53.6,
+      "mul": 35.9,
+      "transpose": 21.1,
+      "reshape": 18.9,
+      "gelu": 16.8,
+      "softmax": 16.8,
+      "masked_fill": 16.8
+    }
+  },
+  "tinystories_forecast": {
+    "tokens": 500000000,
+    "model_2_7m_hours": 40.6,
+    "model_16m_hours": 113.1,
+    "needed_tokens_per_sec_for_12h": 11574,
+    "speedup_needed_on_16m": 9.4,
+    "blocker": "модель 16M требует 3375 МБ при лимите 3072 МБ — не влезает в память"
+  }
 }
