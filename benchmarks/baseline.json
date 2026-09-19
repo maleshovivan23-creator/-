@@ -1,0 +1,37 @@
+{
+  "model": "gpt-2.7m",
+  "n_params": 2678016,
+  "batch": 8,
+  "seq": 64,
+  "n_layer": 4,
+  "n_head": 4,
+  "n_embd": 128,
+  "dtype": "float32",
+  "forward_ms": 43.33,
+  "forward_loss_ms": 40.94,
+  "backward_ms": 55.0,
+  "optimizer_ms": 11.52,
+  "step_ms": 111.16,
+  "steps_per_sec": 9.0,
+  "peak_rss_mb": 1197.6,
+  "tokens_per_sec": 4606.0,
+  "cpu": "x86_64",
+  "cores": 2,
+  "numpy": "2.4.6",
+  "python": "3.11.2",
+  "blas": "scipy-openblas",
+  "before_optimization": {
+    "forward_ms": 109.28,
+    "backward_ms": 63.87,
+    "optimizer_ms": 13.77,
+    "step_ms": 189.82,
+    "steps_per_sec": 5.27,
+    "note": "до трёх правок: x**3 в GELU, аллокации в Adam, батчевый matmul в backward"
+  },
+  "fixes": [
+    "GELU: x**3 -> x*x*x (NumPy уходил в общий pow для float32, x96 на операции)",
+    "Adam: in-place обновления и переиспользуемый буфер вместо ~50 аллокаций на шаг",
+    "matmul backward: reshape вместо батчевого matmul с последующей суммой (x2.6)"
+  ],
+  "speedup_vs_before": 1.71
+}

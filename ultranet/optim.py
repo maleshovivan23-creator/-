@@ -62,6 +62,8 @@ class Adam(Optimizer):
         self.eps, self.wd, self.decoupled = eps, weight_decay, decoupled
         self.m = [np.zeros_like(p.data) for p in self.params]
         self.v = [np.zeros_like(p.data) for p in self.params]
+        #: переиспользуемый буфер под знаменатель — чтобы не аллоцировать на шаге
+        self._buf = [np.zeros_like(p.data) for p in self.params]
 
     def step(self) -> None:
         self.t += 1
@@ -73,13 +75,22 @@ class Adam(Optimizer):
             g = p.grad
             if self.wd and not self.decoupled:
                 g = g + self.wd * p.data
-            self.m[i] = self.b1 * self.m[i] + (1 - self.b1) * g
-            self.v[i] = self.b2 * self.v[i] + (1 - self.b2) * g * g
-            mhat = self.m[i] / bc1
-            vhat = self.v[i] / bc2
+            # in-place: раньше каждая строка порождала новый массив на каждый
+            # параметр каждый шаг. Для GPT-2.7M это ~50 аллокаций на шаг.
+            m, v = self.m[i], self.v[i]
+            m *= self.b1
+            m += (1 - self.b1) * g
+            v *= self.b2
+            v += (1 - self.b2) * (g * g)
             if self.wd and self.decoupled:
                 p.data -= self.lr * self.wd * p.data
-            p.data -= self.lr * mhat / (np.sqrt(vhat) + self.eps)
+            # буфер переиспользуется: sqrt(v/bc2) + eps
+            denom = self._buf[i]
+            np.multiply(v, 1.0 / bc2, out=denom)
+            np.sqrt(denom, out=denom)
+            denom += self.eps
+            np.divide(m, denom, out=denom)
+            p.data -= (self.lr / bc1) * denom
 
 
 AdamW = Adam
