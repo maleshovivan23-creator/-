@@ -38,10 +38,22 @@ class TestMoE:
         assert out.shape == (1, 4, 260)
 
     def test_only_top_k_experts_active(self, moe_model):
-        """«Работают только нужные 10% нейронов»."""
-        total = moe_model.num_params()
-        active = moe_model.active_params(1.0)
-        assert active < total * 0.5, "top-2 из 4 должно быть заметно дешевле плотной сети"
+        """«Работают только нужные 10% нейронов».
+
+        Сравнивать active_params с num_params() всей модели некорректно:
+        в num_params() входят эмбеддинги и attention, которые активны
+        всегда. Честное сравнение — активные эксперты против всех.
+        """
+        moe = moe_model.blocks[0].moe
+        d = moe_model.width_dim(1.0)
+        assert moe.active_params(d) < moe.total_params(d) * 0.75, \
+            "top-2 из 4 экспертов должно быть дешевле, чем все четыре"
+
+    def test_num_params_counts_each_weight_once(self, moe_model):
+        """Регрессия: parameters() отдавал общие веса по нескольку раз."""
+        params = moe_model.parameters()
+        assert len({id(p) for p in params}) == len(params)
+        assert moe_model.num_params() == sum(p.data.size for p in params)
 
     def test_more_experts_more_params(self, moe_model):
         moe_model.set_active_experts(1)

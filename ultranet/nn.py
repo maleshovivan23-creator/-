@@ -46,16 +46,42 @@ class Module:
         object.__setattr__(self, name, value)
 
     def parameters(self) -> List[Parameter]:
-        out = list(self._params.values())
+        """Уникальные параметры módulo повторной регистрации.
+
+        Один и тот же Parameter может быть достижим несколькими путями:
+        список модулей регистрируется как "blocks.i", а ручная запись в
+        _modules добавляет те же блоки под другим именем; при weight tying
+        одна матрица делится головой и эмбеддингом. Без дедупликации
+        оптимизатор применял бы шаг к такому весу дважды за итерацию —
+        фактически удвоенный learning rate именно для общих весов.
+        """
+        out: List[Parameter] = []
+        seen = set()
+        for p in self._params.values():
+            if id(p) not in seen:
+                seen.add(id(p))
+                out.append(p)
         for m in self._modules.values():
-            out.extend(m.parameters())
+            for p in m.parameters():
+                if id(p) not in seen:
+                    seen.add(id(p))
+                    out.append(p)
         return out
 
-    def named_parameters(self, prefix: str = "") -> Iterator[tuple]:
+    def named_parameters(self, prefix: str = "", _seen: Optional[set] = None) -> Iterator[tuple]:
+        """Как parameters(), но с именами и тоже без повторов.
+
+        Общий вес выдаётся один раз — под первым встреченным именем.
+        Иначе summary() и подсчёт памяти удваивали бы связанные матрицы.
+        """
+        if _seen is None:
+            _seen = set()
         for k, v in self._params.items():
-            yield f"{prefix}{k}", v
+            if id(v) not in _seen:
+                _seen.add(id(v))
+                yield f"{prefix}{k}", v
         for name, m in self._modules.items():
-            yield from m.named_parameters(f"{prefix}{name}.")
+            yield from m.named_parameters(f"{prefix}{name}.", _seen)
 
     def num_params(self) -> int:
         return sum(p.size for p in self.parameters())
