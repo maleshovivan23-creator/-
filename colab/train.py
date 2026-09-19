@@ -129,6 +129,16 @@ def train(cfg: dict) -> None:
     t0 = time.time()
     tokens_done = 0
 
+    # Kaggle обрывает сессию по таймауту (обычно 12 ч) без предупреждения,
+    # и всё, что случилось после последнего чекпоинта, теряется. Выходим
+    # сами, заранее, сохранив состояние.
+    deadline = t0 + cfg["max_hours"] * 3600 if cfg.get("max_hours") else None
+
+    def save(step: int, name: str = "last.pt") -> None:
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
+                    "sched": sched.state_dict(), "scaler": scaler.state_dict(),
+                    "step": step, "cfg": cfg, "gcfg": vars(gcfg)}, out / name)
+
     for step in range(step0, cfg["steps"]):
         x, y = get_batch(train_data, cfg["batch"], cfg["seq"], device, rng)
         with torch.autocast("cuda", dtype=torch.float16, enabled=device == "cuda"):
@@ -163,13 +173,18 @@ def train(cfg: dict) -> None:
                 f.write(f"--- шаг {step} ---\n{text}\n\n")
 
         if step and step % cfg["ckpt_every"] == 0:
-            torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
-                        "sched": sched.state_dict(), "scaler": scaler.state_dict(),
-                        "step": step, "cfg": cfg, "gcfg": vars(gcfg)}, ckpt)
+            save(step)
             print(f"  сохранено: {ckpt}")
 
-    torch.save({"model": model.state_dict(), "step": cfg["steps"],
-                "cfg": cfg, "gcfg": vars(gcfg)}, out / "final.pt")
+        if deadline and time.time() > deadline:
+            save(step)
+            left = cfg["steps"] - step - 1
+            print(f"\n  лимит {cfg['max_hours']} ч исчерпан на шаге {step}. "
+                  f"Состояние сохранено, осталось {left:,} шагов.")
+            print("  Перезапустите ту же ячейку — продолжит отсюда.")
+            return
+
+    save(cfg["steps"] - 1, "final.pt")
     print("готово")
 
 
@@ -180,7 +195,7 @@ def default_cfg(**kw) -> dict:
         dim=256, layers=6, heads=8, seq=256, batch=32,
         steps=60000, lr=6e-4, dropout=0.0,
         log_every=100, eval_every=1000, sample_every=1000,
-        ckpt_every=500, sample_len=120,
+        ckpt_every=500, sample_len=120, max_hours=None,
         prompt="Once upon a time",
         out="checkpoints/tinystories-16m", seed=0)
     cfg.update(kw)
@@ -197,5 +212,11 @@ if __name__ == "__main__":
     ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--lr", type=float, default=6e-4)
     ap.add_argument("--out", default="checkpoints/tinystories-16m")
+    ap.add_argument("--train-bin", default="data/train.bin", dest="train_bin")
+    ap.add_argument("--val-bin", default="data/val.bin", dest="val_bin")
+    ap.add_argument("--tokenizer", default="data/tokenizer.json")
+    ap.add_argument("--prompt", default="Once upon a time")
+    ap.add_argument("--max-hours", type=float, default=None, dest="max_hours",
+                    help="выйти заранее, сохранив состояние (Kaggle рвёт сессию на 12 ч)")
     a = ap.parse_args()
     train(default_cfg(**vars(a)))
