@@ -14,15 +14,18 @@ from .weights import (RVQ, ComplexWeight, FisherImportance, FractalStack,
                       HyperNetwork, LogPolarWeight, SphericalWeight,
                       compare_methods, cosine, rel_error, slerp)
 from .bytes import ByteTokenizer, make_byte_batches
-from .controller import MetaController, Plan
+from .controller import RLMetaController, MetaController, Plan
 from .devices import DEVICES, Device, DeviceState, get_device, list_devices
 from .memory import Doc, LocalMemory
 from .swarm import Node, Swarm
 from .matformer import MatBlock, MatConfig, MatFormer
 from .train import evaluate_widths, train_matryoshka
-from .quant import QuantStats, TernaryModel, quantization_error, ternary_quantize
+from .quant import TernaryLinear, ste_round, QuantStats, TernaryModel, quantization_error, ternary_quantize
 
 __all__ = [
+    "TernaryLinear",
+    "ste_round",
+    "RLMetaController",
     "Proteus", "Response",
     "MoE", "Expert", "SteeringLibrary", "SteeringVector",
     "PersonalAdapter", "LoRALayer", "Feedback",

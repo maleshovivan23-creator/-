@@ -10,9 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
+import math
+
 import numpy as np
 
 from ..nn import Module, Parameter
+from ..tensor import Tensor
 
 
 def ternary_quantize(w: np.ndarray) -> Tuple[np.ndarray, float]:
@@ -128,3 +131,49 @@ def quantization_error(model: Module) -> Dict[str, float]:
         approx = q.astype(np.float32) * s
         errs[name] = float(np.linalg.norm(approx - p.data) / (np.linalg.norm(p.data) + 1e-9))
     return errs
+
+
+# ═══════════════════════════════════ обучение квантованной сети (STE)
+class TernaryLinear(Module):
+    """Слой, который обучается сразу в тернарном виде через STE.
+
+    Straight-Through Estimator: в forward веса округляются до {-1, 0, 1},
+    а градиент проходит сквозь округление к теневым FP-весам. Так сеть
+    учится жить с тем квантованием, с которым будет работать.
+    """
+
+    def __init__(self, in_f: int, out_f: int, bias: bool = False) -> None:
+        super().__init__()
+        from ..tensor import get_rng
+        self.in_f, self.out_f = in_f, out_f
+        # теневые веса высокой точности — обучаются, но не используются напрямую
+        self.weight = Parameter(get_rng().standard_normal((in_f, out_f)).astype(np.float32)
+                                / math.sqrt(in_f))
+        self.bias = Parameter(np.zeros(out_f, dtype=np.float32)) if bias else None
+
+    def quantized_weight(self) -> Tensor:
+        """w_q = round(clip(w/scale)) * scale, градиент идёт мимо round."""
+        w = self.weight
+        scale = float(np.abs(w.data).mean()) or 1.0
+        q = np.clip(np.rint(w.data / scale), -1.0, 1.0) * scale
+        # STE: значение квантованное, градиент — как у исходного веса
+        return w + Tensor(q - w.data)
+
+    def forward(self, x: Tensor) -> Tensor:
+        out = x @ self.quantized_weight()
+        return out + self.bias if self.bias is not None else out
+
+    def ternary_fraction(self) -> float:
+        scale = float(np.abs(self.weight.data).mean()) or 1.0
+        q = np.clip(np.rint(self.weight.data / scale), -1.0, 1.0)
+        return float(np.isin(q, (-1.0, 0.0, 1.0)).mean())
+
+    def bits_per_weight(self) -> float:
+        return math.log2(3)
+
+
+def ste_round(x: Tensor, levels: int = 3) -> Tensor:
+    """Округление с прохождением градиента насквозь (для любых схем)."""
+    half = (levels - 1) / 2.0
+    q = np.clip(np.rint(x.data * half), -half, half) / half
+    return x + Tensor(q - x.data)
