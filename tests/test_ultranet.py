@@ -179,3 +179,405 @@ def test_dropout_eval_is_identity():
     d = nn.Dropout(0.5).eval()
     x = Tensor(np.ones((4, 4)))
     assert np.allclose(d(x).data, 1.0)
+
+
+# ======================================================================
+#                    Тесты v2: новые возможности
+# ======================================================================
+
+def test_no_grad_disables_graph():
+    from ultranet import no_grad
+    x = Tensor(np.random.randn(3, 3), requires_grad=True)
+    with no_grad():
+        y = (x * 2).sum()
+    assert not y.requires_grad
+    z = (x * 2).sum()
+    assert z.requires_grad
+
+
+def test_fused_softmax_grad():
+    x = Tensor(np.random.randn(4, 6), requires_grad=True)
+    check(lambda: (x.softmax(axis=-1) * Tensor(np.random.RandomState(0).randn(4, 6))).sum(), x)
+
+
+def test_fused_log_softmax_matches_naive():
+    x = Tensor(np.random.randn(5, 7))
+    naive = x.data - np.log(np.exp(x.data - x.data.max(-1, keepdims=True)).sum(-1, keepdims=True)) \
+        - x.data.max(-1, keepdims=True)
+    assert np.allclose(x.log_softmax(-1).data, naive, atol=1e-5)
+
+
+def test_fused_cross_entropy_grad():
+    logits = Tensor(np.random.randn(8, 5), requires_grad=True)
+    y = np.array([0, 1, 2, 3, 4, 0, 1, 2])
+    check(lambda: un.cross_entropy(logits, y), logits)
+
+
+def test_cross_entropy_ignore_index():
+    logits = Tensor(np.random.randn(4, 3), requires_grad=True)
+    y = np.array([0, 1, -100, 2])
+    loss = un.cross_entropy(logits, y, ignore_index=-100)
+    loss.backward()
+    assert np.allclose(logits.grad[2], 0.0), "игнорируемая позиция не должна давать градиент"
+
+
+def test_new_activations_grad():
+    x = Tensor(np.random.randn(4, 4), requires_grad=True)
+    for fn in ["silu", "sin", "cos"]:
+        check(lambda fn=fn: getattr(x, fn)().sum(), x)
+
+
+def test_rmsnorm_grad():
+    rn = nn.RMSNorm(6)
+    x = Tensor(np.random.randn(3, 6), requires_grad=True)
+    check(lambda: (rn(x) ** 2).sum(), x, rn.gamma)
+
+
+def test_rope_preserves_norm_and_is_relative():
+    rope = nn.RotaryEmbedding(8, 64)
+    x = Tensor(np.random.randn(1, 2, 6, 8).astype(np.float32))
+    y = rope(x)
+    assert np.allclose(np.linalg.norm(x.data, axis=-1), np.linalg.norm(y.data, axis=-1), atol=1e-4)
+    # скалярное произведение зависит только от разности позиций
+    q = np.random.randn(1, 1, 1, 8).astype(np.float32)
+    k = np.random.randn(1, 1, 1, 8).astype(np.float32)
+    d1 = float((rope(Tensor(q), 2).data * rope(Tensor(k), 5).data).sum())
+    d2 = float((rope(Tensor(q), 10).data * rope(Tensor(k), 13).data).sum())
+    assert abs(d1 - d2) < 1e-3
+
+
+def test_rope_grad():
+    rope = nn.RotaryEmbedding(4, 16)
+    x = Tensor(np.random.randn(1, 1, 3, 4), requires_grad=True)
+    check(lambda: (rope(x) ** 2).sum(), x)
+
+
+def test_swiglu_grad():
+    m = nn.SwiGLU(8, hidden=16)
+    x = Tensor(np.random.randn(2, 8) * 0.5, requires_grad=True)
+    check(lambda: m(x).sum(), x, m.w_down.weight, tol=5e-2)
+
+
+def test_avgpool_grad():
+    p = nn.AvgPool2d(2)
+    x = Tensor(np.random.randn(1, 2, 4, 4), requires_grad=True)
+    check(lambda: (p(x) ** 2).sum(), x)
+
+
+def test_lstm_cell_shapes_and_grad():
+    cell = nn.LSTMCell(3, 4)
+    x = Tensor(np.random.randn(2, 3), requires_grad=True)
+    h, c = Tensor(np.zeros((2, 4))), Tensor(np.zeros((2, 4)))
+    check(lambda: cell(x, (h, c))[0].sum(), x, tol=5e-2)
+
+
+def test_kv_cache_matches_full_forward():
+    cfg = un.GPTConfig(vocab_size=17, block_size=16, n_layer=2, n_head=2, n_embd=32)
+    m = un.GPT(cfg).eval()
+    seq = [1, 5, 9, 3, 7]
+    full = m(np.array([seq])).data[0, -1]
+    m.reset_cache()
+    m(np.array([seq[:-1]]), use_cache=True)
+    inc = m(np.array([[seq[-1]]]), use_cache=True, pos_offset=len(seq) - 1).data[0, -1]
+    assert np.allclose(full, inc, atol=1e-4), np.abs(full - inc).max()
+
+
+def test_generate_cache_equals_nocache():
+    cfg = un.GPTConfig(vocab_size=13, block_size=12, n_layer=2, n_head=2, n_embd=32)
+    m = un.GPT(cfg).eval()
+    a = m.generate([2, 3], 12, temperature=0.9, top_k=5, use_cache=True, seed=11)
+    b = m.generate([2, 3], 12, temperature=0.9, top_k=5, use_cache=False, seed=11)
+    assert a == b
+
+
+def test_greedy_is_deterministic_and_stop_tokens():
+    cfg = un.GPTConfig(vocab_size=11, block_size=12, n_layer=1, n_head=2, n_embd=16)
+    m = un.GPT(cfg).eval()
+    a = m.generate([1], 10, temperature=0.0)
+    b = m.generate([1], 10, temperature=0.0)
+    assert a == b
+    out = m.generate([1], 30, temperature=0.0, stop_tokens=[a[1]])
+    assert out[-1] == a[1] and len(out) == 2
+
+
+def test_weight_tying_reduces_params():
+    kw = dict(vocab_size=500, block_size=16, n_layer=2, n_head=2, n_embd=64)
+    tied = un.GPT(un.GPTConfig(tie_weights=True, **kw)).num_params()
+    untied = un.GPT(un.GPTConfig(tie_weights=False, **kw)).num_params()
+    assert untied - tied == 500 * 64
+
+
+def test_llama_style_gpt_trains():
+    text = "данные учат модель. " * 30
+    tok = un.CharTokenizer(text)
+    ids = tok.encode(text)
+    cfg = un.GPTConfig.llama_style(tok.vocab_size, block_size=16, n_layer=2, n_head=2, n_embd=32)
+    assert cfg.rope and cfg.norm == "rms" and cfg.swiglu
+    m = un.GPT(cfg)
+    opt = un.AdamW(m.parameters(), lr=3e-3)
+    first = last = None
+    for _ in range(80):
+        xb, yb = un.make_lm_batches(ids, 16, 8)
+        loss = un.cross_entropy(m(xb), yb)
+        opt.zero_grad()
+        loss.backward()
+        opt.clip_grad_norm(1.0)
+        opt.step()
+        first = first if first is not None else loss.item()
+        last = loss.item()
+    assert last < first * 0.6, (first, last)
+
+
+def test_rope_extrapolates_beyond_training_length():
+    """RoPE-модель принимает последовательности длиннее block_size без ошибок."""
+    cfg = un.GPTConfig.llama_style(12, block_size=8, n_layer=1, n_head=2, n_embd=16)
+    m = un.GPT(cfg).eval()
+    out = m(np.random.randint(0, 12, (1, 20)))
+    assert out.shape == (1, 20, 12)
+
+
+def test_resnet_learns():
+    x, y = un.data.make_digits_like(300, 8, 4, seed=5)
+    m = un.ResNet(1, 4, width=8, n_blocks=1, img_size=8)
+    tr = un.Trainer(m, un.Adam(m.parameters(), lr=3e-3), verbose=False)
+    tr.fit(un.DataLoader(x, y, 32), epochs=6)
+    assert tr.history["metric"][-1] > 0.8
+
+
+def test_text_classifier_learns():
+    rng = np.random.default_rng(0)
+    n, L, V = 300, 10, 12
+    x = rng.integers(2, V, (n, L))
+    y = rng.integers(0, 2, n)
+    x[y == 1, 0] = 1  # маркерный токен в начале
+    x[y == 0, 0] = 0
+    m = un.TextClassifier(V, 2, n_embd=32, n_layer=1, n_head=2, max_len=L)
+    tr = un.Trainer(m, un.Adam(m.parameters(), lr=3e-3), verbose=False)
+    tr.fit(un.DataLoader(x, y, 32), epochs=10)
+    assert tr.history["metric"][-1] > 0.9
+
+
+def test_new_optimizers_reduce_loss():
+    for opt_cls in [un.Lion, un.Adagrad]:
+        np.random.seed(0)
+        model = un.MLP([2, 16, 2])
+        x, y = un.make_moons(200, seed=3)
+        opt = opt_cls(model.parameters(), lr=1e-2)
+        first = last = None
+        for _ in range(60):
+            loss = un.cross_entropy(model(Tensor(x)), y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            first = first if first is not None else loss.item()
+            last = loss.item()
+        assert last < first, opt_cls.__name__
+
+
+def test_lookahead_wraps_base():
+    model = un.MLP([2, 8, 2])
+    base = un.Adam(model.parameters(), lr=1e-2)
+    opt = un.Lookahead(base, k=3)
+    x, y = un.make_moons(120, seed=1)
+    first = last = None
+    for _ in range(30):
+        loss = un.cross_entropy(model(Tensor(x)), y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        first = first if first is not None else loss.item()
+        last = loss.item()
+    assert last < first
+
+
+def test_ema_tracks_weights():
+    model = un.MLP([2, 4, 2])
+    ema = un.EMA(model.parameters(), decay=0.5, warmup=False)
+    p = model.parameters()[0]
+    orig = p.data.copy()
+    p.data += 1.0
+    ema.update()
+    ema.apply()
+    assert np.allclose(p.data, orig + 0.5, atol=1e-5)
+    ema.restore()
+    assert np.allclose(p.data, orig + 1.0)
+
+
+def test_onecycle_and_plateau_schedulers():
+    m = un.MLP([2, 4, 2])
+    opt = un.Adam(m.parameters(), lr=1.0)
+    oc = un.OneCycleLR(opt, max_lr=1.0, total=100, pct_start=0.3)
+    lrs = [oc.step() for _ in range(100)]
+    assert lrs[0] < max(lrs) and lrs[-1] < lrs[0]
+    assert abs(max(lrs) - 1.0) < 1e-6
+
+    opt2 = un.Adam(m.parameters(), lr=1.0)
+    pl = un.ReduceLROnPlateau(opt2, factor=0.5, patience=1)
+    for _ in range(5):
+        pl.step(1.0)  # метрика не улучшается
+    assert opt2.lr < 1.0
+
+
+def test_grad_accumulation_equivalence():
+    """Накопление градиентов по 2 микробатчам == один большой батч."""
+    np.random.seed(0)
+    x, y = un.make_moons(64, seed=0)
+    m1 = un.MLP([2, 8, 2])
+    sd = m1.state_dict()
+    m2 = un.MLP([2, 8, 2])
+    m2.load_state_dict(sd)
+
+    loss = un.cross_entropy(m1(Tensor(x)), y)
+    m1.zero_grad()
+    loss.backward()
+    g_full = m1.parameters()[0].grad.copy()
+
+    m2.zero_grad()
+    for half in range(2):
+        xb, yb = x[half * 32:(half + 1) * 32], y[half * 32:(half + 1) * 32]
+        (un.cross_entropy(m2(Tensor(xb)), yb) * 0.5).backward()
+    assert np.allclose(g_full, m2.parameters()[0].grad, atol=1e-5)
+
+
+def test_trainer_accum_and_ema_and_checkpoint(tmp_path):
+    x, y = un.make_moons(256, seed=2)
+    m = un.MLP([2, 16, 2])
+    ckpt = tmp_path / "best.pkl"
+    tr = un.Trainer(m, un.Adam(m.parameters(), lr=5e-3), verbose=False,
+                    accum_steps=2, ema_decay=0.9, checkpoint_path=str(ckpt), grad_clip=1.0)
+    hist = tr.fit(un.DataLoader(x, y, 32), un.DataLoader(x, y, 64, shuffle=False), epochs=5)
+    assert ckpt.exists()
+    assert len(hist["lr"]) == 5 and len(hist["grad_norm"]) == 5
+    assert hist["loss"][-1] < hist["loss"][0]
+
+
+def test_trainer_plot_history_ascii():
+    x, y = un.make_moons(120, seed=4)
+    m = un.MLP([2, 8, 2])
+    tr = un.Trainer(m, un.Adam(m.parameters(), lr=1e-2), verbose=False)
+    tr.fit(un.DataLoader(x, y, 32), un.DataLoader(x, y, 64, shuffle=False), epochs=4)
+    plot = tr.plot_history()
+    assert "train" in plot and "эпохи" in plot and len(plot.splitlines()) > 5
+
+
+def test_trainer_callback_can_stop():
+    x, y = un.make_moons(120, seed=4)
+    m = un.MLP([2, 8, 2])
+
+    def cb(trainer, epoch):
+        if epoch == 2:
+            trainer.stop()
+
+    tr = un.Trainer(m, un.Adam(m.parameters(), lr=1e-2), verbose=False, callbacks=[cb])
+    hist = tr.fit(un.DataLoader(x, y, 32), epochs=20)
+    assert len(hist["loss"]) == 2
+
+
+def test_regression_losses():
+    x, y = un.make_regression(200, 1, seed=0)
+    m = un.MLP([1, 32, 32, 1], activation="tanh")
+    opt = un.Adam(m.parameters(), lr=1e-2)
+    first = last = None
+    for _ in range(300):
+        loss = un.mse_loss(m(Tensor(x)), y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        first = first if first is not None else loss.item()
+        last = loss.item()
+    assert last < first * 0.2
+    assert un.mae_loss(m(Tensor(x)), y).item() < 0.5
+    assert un.huber_loss(m(Tensor(x)), y).item() >= 0
+
+
+def test_huber_and_bce_logits_grad():
+    pred = Tensor(np.random.randn(6, 1), requires_grad=True)
+    tgt = np.random.randn(6, 1).astype(np.float32)
+    check(lambda: un.huber_loss(pred, tgt, delta=1.0), pred)
+
+    logits = Tensor(np.random.randn(6, 1), requires_grad=True)
+    ybin = (np.random.rand(6, 1) > 0.5).astype(np.float32)
+    check(lambda: un.bce_with_logits(logits, ybin), logits)
+
+
+def test_focal_loss_runs_and_grads():
+    logits = Tensor(np.random.randn(8, 4), requires_grad=True)
+    y = np.random.randint(0, 4, 8)
+    loss = un.focal_loss(logits, y, gamma=2.0)
+    loss.backward()
+    assert logits.grad is not None and np.isfinite(loss.item())
+
+
+def test_metrics():
+    logits = Tensor(np.array([[3.0, 0.1, 0.2], [0.1, 2.0, 0.3], [0.0, 0.1, 5.0]]))
+    y = np.array([0, 1, 2])
+    assert un.accuracy(logits, y) == 1.0
+    assert un.top_k_accuracy(logits, y, k=2) == 1.0
+    assert un.f1_score(logits, y) == 1.0
+    cm = un.confusion_matrix(logits, y)
+    assert np.array_equal(cm, np.eye(3, dtype=int))
+    assert abs(un.perplexity(0.0) - 1.0) < 1e-6
+
+
+def test_dataset_and_normalize():
+    x, y = un.make_moons(60, seed=0)
+    ds = un.Dataset(x, y)
+    assert len(ds) == 60 and ds[0][0].shape == (2,)
+    xb, yb = next(iter(ds.loader(16)))
+    assert xb.shape == (16, 2)
+    xn, mean, std = un.normalize(x)
+    assert abs(float(xn.mean())) < 1e-5 and abs(float(xn.std()) - 1.0) < 1e-2
+
+
+def test_word_tokenizer_roundtrip():
+    tok = un.WordTokenizer("кот сидит на окне кот спит")
+    ids = tok.encode("кот спит")
+    assert tok.decode(ids) == "кот спит"
+    assert tok.encode("неизвестное")[0] == 1  # <unk>
+
+
+def test_no_grad_speeds_up_and_no_graph():
+    from ultranet import no_grad
+    m = un.MLP([16, 64, 16])
+    x = Tensor(np.random.randn(32, 16))
+    with no_grad():
+        out = m(x)
+    assert not out.requires_grad and out._prev == ()
+
+
+def test_ema_warmup_tracks_early_updates():
+    """На первых шагах EMA не должна сильно отставать от весов."""
+    m = un.MLP([2, 4, 2])
+    p = m.parameters()[0]
+    ema = un.EMA(m.parameters(), decay=0.999, warmup=True)
+    target = p.data.copy() + 5.0
+    p.data = target.copy()
+    for _ in range(5):
+        ema.update()
+    ema.apply()
+    # с прогревом среднее заметно продвинулось к target (без прогрева было бы ~0.5%)
+    assert np.abs(p.data - target).mean() < np.abs(target).mean() * 0.7
+    ema.restore()
+
+
+def test_cli_demo_and_bench_run():
+    from ultranet.cli import main
+    main(["demo"])  # не должно падать
+
+
+def test_cli_train_and_generate_roundtrip(tmp_path, capsys):
+    from ultranet.cli import main
+    out = tmp_path / "cli.pkl"
+    main(["train-text", "--steps", "20", "--layers", "1", "--embd", "32",
+          "--block", "16", "--out", str(out), "--tokens", "20"])
+    assert out.exists() and (tmp_path / "cli.pkl.json").exists()
+    capsys.readouterr()
+    main(["generate", "--checkpoint", str(out), "--prompt", "не", "--tokens", "15", "--seed", "0"])
+    text = capsys.readouterr().out.strip()
+    assert len(text) > 5
+
+
+def test_benchmark_timeit_helper():
+    from ultranet.benchmark import timeit
+    ms = timeit(lambda: np.zeros((10, 10)), n=3, warmup=1)
+    assert ms >= 0

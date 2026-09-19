@@ -75,6 +75,62 @@ def make_digits_like(n: int = 400, size: int = 8, n_classes: int = 4, seed: int 
     return x, y.astype(int)
 
 
+class Dataset:
+    """Простейшая обёртка над массивами (x, y) с поддержкой len/индексации."""
+
+    def __init__(self, x: np.ndarray, y: np.ndarray) -> None:
+        assert len(x) == len(y), "x и y должны быть одной длины"
+        self.x, self.y = np.asarray(x), np.asarray(y)
+
+    def __len__(self) -> int:
+        return len(self.x)
+
+    def __getitem__(self, i):
+        return self.x[i], self.y[i]
+
+    def loader(self, batch_size: int = 32, shuffle: bool = True) -> "DataLoader":
+        return DataLoader(self.x, self.y, batch_size, shuffle)
+
+
+def normalize(x: np.ndarray, mean=None, std=None):
+    """Стандартизация признаков; возвращает (x_norm, mean, std) для переиспользования."""
+    mean = x.mean(0, keepdims=True) if mean is None else mean
+    std = x.std(0, keepdims=True) + 1e-8 if std is None else std
+    return ((x - mean) / std).astype(np.float32), mean, std
+
+
+def make_regression(n: int = 500, n_features: int = 1, noise: float = 0.1, seed: int = 0):
+    """Нелинейная регрессия y = sin(3x) + шум."""
+    rng = np.random.default_rng(seed)
+    x = rng.uniform(-2, 2, (n, n_features)).astype(np.float32)
+    y = (np.sin(3 * x).sum(1) + rng.normal(0, noise, n)).astype(np.float32)
+    return x, y[:, None]
+
+
+class WordTokenizer:
+    """Пословный токенизатор со словарём частотных слов и <unk>."""
+
+    def __init__(self, text: str, max_vocab: int = 5000) -> None:
+        from collections import Counter
+
+        words = text.split()
+        freq = Counter(words).most_common(max_vocab - 2)
+        self.itos = {0: "<pad>", 1: "<unk>"}
+        for i, (w, _) in enumerate(freq):
+            self.itos[i + 2] = w
+        self.stoi = {w: i for i, w in self.itos.items()}
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.itos)
+
+    def encode(self, s: str) -> List[int]:
+        return [self.stoi.get(w, 1) for w in s.split()]
+
+    def decode(self, ids) -> str:
+        return " ".join(self.itos[int(i)] for i in ids)
+
+
 class CharTokenizer:
     """Простейший символьный токенизатор для языковой модели."""
 

@@ -133,6 +133,19 @@ class LayerNorm(Module):
         return xc / (var + self.eps).sqrt() * self.gamma + self.beta
 
 
+class RMSNorm(Module):
+    """RMSNorm (LLaMA/T5): нормировка без вычитания среднего — быстрее LayerNorm."""
+
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.gamma = Parameter(np.ones(dim, dtype=np.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        rms = ((x ** 2).mean(axis=-1, keepdims=True) + self.eps).sqrt()
+        return x / rms * self.gamma
+
+
 class BatchNorm1d(Module):
     def __init__(self, dim: int, eps: float = 1e-5, momentum: float = 0.1) -> None:
         super().__init__()
@@ -172,6 +185,11 @@ class ReLU(Module):
 class GELU(Module):
     def forward(self, x: Tensor) -> Tensor:
         return x.gelu()
+
+
+class SiLU(Module):
+    def forward(self, x: Tensor) -> Tensor:
+        return x.silu()
 
 
 class Tanh(Module):
@@ -303,11 +321,74 @@ class MaxPool2d(Module):
         return out
 
 
-# ---------------------------------------------------------------- внимание
-class MultiHeadAttention(Module):
-    """Многоголовое самовнимание с опциональной причинной маской."""
+class AvgPool2d(Module):
+    """Усредняющий пулинг (N, C, H, W)."""
 
-    def __init__(self, dim: int, n_heads: int, dropout: float = 0.0, causal: bool = True) -> None:
+    def __init__(self, kernel_size: int = 2, stride: Optional[int] = None) -> None:
+        super().__init__()
+        self.k = kernel_size
+        self.stride = stride or kernel_size
+
+    def forward(self, x: Tensor) -> Tensor:
+        n, c, h, w = x.shape
+        k, s = self.k, self.stride
+        oh, ow = (h - k) // s + 1, (w - k) // s + 1
+        strided = np.lib.stride_tricks.as_strided(
+            x.data,
+            shape=(n, c, oh, ow, k, k),
+            strides=x.data.strides[:2] + (x.data.strides[2] * s, x.data.strides[3] * s) + x.data.strides[2:],
+        )
+        out = x._make(strided.reshape(n, c, oh, ow, k * k).mean(-1), (x,), "avgpool")
+
+        def _backward() -> None:
+            gx = np.zeros_like(x.data)
+            g = out.grad / (k * k)
+            for i in range(k):
+                for j in range(k):
+                    gx[:, :, i:i + s * oh:s, j:j + s * ow:s] += g
+            x._accum(gx)
+
+        out._backward = _backward
+        return out
+
+
+# ---------------------------------------------------------------- внимание
+class RotaryEmbedding(Module):
+    """RoPE — вращательное позиционное кодирование (LLaMA, GPT-NeoX).
+
+    Кодирует относительные позиции прямо в q/k, поэтому модель лучше
+    обобщается на длины, не встречавшиеся при обучении.
+    """
+
+    def __init__(self, head_dim: int, max_seq: int = 4096, base: float = 10000.0) -> None:
+        super().__init__()
+        assert head_dim % 2 == 0, "head_dim должен быть чётным для RoPE"
+        self.head_dim = head_dim
+        inv_freq = 1.0 / (base ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim))
+        t = np.arange(max_seq, dtype=np.float32)
+        freqs = np.outer(t, inv_freq)
+        self.cos = np.cos(freqs).astype(np.float32)  # (max_seq, head_dim/2)
+        self.sin = np.sin(freqs).astype(np.float32)
+
+    def forward(self, x: Tensor, offset: int = 0) -> Tensor:
+        """x: (B, H, T, head_dim) -> повёрнутый тензор той же формы."""
+        t = x.shape[2]
+        cos = self.cos[offset:offset + t][None, None]  # (1,1,T,hd/2)
+        sin = self.sin[offset:offset + t][None, None]
+        x1 = x[:, :, :, 0::2]
+        x2 = x[:, :, :, 1::2]
+        rot1 = x1 * Tensor(cos) - x2 * Tensor(sin)
+        rot2 = x1 * Tensor(sin) + x2 * Tensor(cos)
+        # обратное чередование: (..., hd/2, 2) -> (..., hd)
+        stacked = cat([rot1.reshape(*rot1.shape, 1), rot2.reshape(*rot2.shape, 1)], axis=-1)
+        return stacked.reshape(*x.shape)
+
+
+class MultiHeadAttention(Module):
+    """Многоголовое самовнимание: causal-маска, RoPE и KV-кэш для генерации."""
+
+    def __init__(self, dim: int, n_heads: int, dropout: float = 0.0, causal: bool = True,
+                 rope: bool = False, max_seq: int = 4096) -> None:
         super().__init__()
         assert dim % n_heads == 0, "dim должен делиться на n_heads"
         self.dim, self.n_heads, self.head_dim = dim, n_heads, dim // n_heads
@@ -316,41 +397,83 @@ class MultiHeadAttention(Module):
         self.proj = Linear(dim, dim)
         self.attn_drop = Dropout(dropout)
         self.resid_drop = Dropout(dropout)
+        self.rope = RotaryEmbedding(self.head_dim, max_seq) if rope else None
+        self._cache: Optional[tuple] = None
 
-    def forward(self, x: Tensor) -> Tensor:
+    def reset_cache(self) -> None:
+        self._cache = None
+
+    def forward(self, x: Tensor, use_cache: bool = False) -> Tensor:
         b, t, c = x.shape
-        qkv = self.qkv(x)  # (B, T, 3C)
+        qkv = self.qkv(x)
         q = qkv[:, :, :c].reshape(b, t, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = qkv[:, :, c:2 * c].reshape(b, t, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = qkv[:, :, 2 * c:].reshape(b, t, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
 
+        offset = self._cache[0].shape[2] if (use_cache and self._cache is not None) else 0
+        if self.rope is not None:
+            q, k = self.rope(q, offset), self.rope(k, offset)
+
+        if use_cache:
+            if self._cache is not None:
+                pk, pv = self._cache
+                k = cat([Tensor(pk), k], axis=2)
+                v = cat([Tensor(pv), v], axis=2)
+            self._cache = (k.data, v.data)
+
         att = (q @ k.transpose(0, 1, 3, 2)) * (1.0 / math.sqrt(self.head_dim))
         if self.causal:
-            mask = np.triu(np.ones((t, t), dtype=bool), k=1)[None, None]
+            tk = k.shape[2]
+            # при генерации с кэшем запрос видит весь префикс, маска сдвигается на offset
+            mask = np.triu(np.ones((t, tk), dtype=bool), k=1 + offset)[None, None]
             att = att.masked_fill(np.broadcast_to(mask, att.shape), -1e9)
         att = self.attn_drop(att.softmax(axis=-1))
         y = (att @ v).transpose(0, 2, 1, 3).reshape(b, t, c)
         return self.resid_drop(self.proj(y))
 
 
-class TransformerBlock(Module):
-    """Pre-LN блок трансформера: attention + MLP с остаточными связями."""
+class SwiGLU(Module):
+    """SwiGLU-MLP из LLaMA: gate * silu(up) — сильнее обычного GELU-MLP."""
 
-    def __init__(self, dim: int, n_heads: int, mlp_ratio: int = 4, dropout: float = 0.0,
-                 causal: bool = True) -> None:
+    def __init__(self, dim: int, hidden: Optional[int] = None, dropout: float = 0.0) -> None:
         super().__init__()
-        self.ln1 = LayerNorm(dim)
-        self.attn = MultiHeadAttention(dim, n_heads, dropout, causal)
-        self.ln2 = LayerNorm(dim)
-        self.mlp = Sequential(
-            Linear(dim, mlp_ratio * dim),
-            GELU(),
-            Linear(mlp_ratio * dim, dim),
-            Dropout(dropout),
-        )
+        hidden = hidden or int(8 * dim / 3 // 32 * 32) or 4 * dim
+        self.w_gate = Linear(dim, hidden, bias=False)
+        self.w_up = Linear(dim, hidden, bias=False)
+        self.w_down = Linear(hidden, dim, bias=False)
+        self.drop = Dropout(dropout)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = x + self.attn(self.ln1(x))
+        return self.drop(self.w_down(self.w_gate(x).silu() * self.w_up(x)))
+
+
+class TransformerBlock(Module):
+    """Pre-LN блок трансформера: attention + MLP с остаточными связями.
+
+    Поддерживает современный режим (RMSNorm + RoPE + SwiGLU) и классический
+    GPT-2 (LayerNorm + выученные позиции + GELU-MLP).
+    """
+
+    def __init__(self, dim: int, n_heads: int, mlp_ratio: int = 4, dropout: float = 0.0,
+                 causal: bool = True, rope: bool = False, norm: str = "layer",
+                 swiglu: bool = False, max_seq: int = 4096) -> None:
+        super().__init__()
+        make_norm = (lambda: RMSNorm(dim)) if norm == "rms" else (lambda: LayerNorm(dim))
+        self.ln1 = make_norm()
+        self.attn = MultiHeadAttention(dim, n_heads, dropout, causal, rope=rope, max_seq=max_seq)
+        self.ln2 = make_norm()
+        if swiglu:
+            self.mlp = SwiGLU(dim, dropout=dropout)
+        else:
+            self.mlp = Sequential(
+                Linear(dim, mlp_ratio * dim),
+                GELU(),
+                Linear(mlp_ratio * dim, dim),
+                Dropout(dropout),
+            )
+
+    def forward(self, x: Tensor, use_cache: bool = False) -> Tensor:
+        x = x + self.attn(self.ln1(x), use_cache=use_cache)
         return x + self.mlp(self.ln2(x))
 
 
@@ -363,6 +486,27 @@ class RNNCell(Module):
 
     def forward(self, x: Tensor, h: Tensor) -> Tensor:
         return (self.wx(x) + self.wh(h)).tanh()
+
+
+class LSTMCell(Module):
+    """LSTM-ячейка с входным/забывающим/выходным вентилями."""
+
+    def __init__(self, in_dim: int, hidden: int) -> None:
+        super().__init__()
+        self.x2h = Linear(in_dim, 4 * hidden)
+        self.h2h = Linear(hidden, 4 * hidden, bias=False)
+        self.hidden = hidden
+
+    def forward(self, x: Tensor, state) -> tuple:
+        h, c = state
+        g = self.x2h(x) + self.h2h(h)
+        n = self.hidden
+        i = g[:, 0:n].sigmoid()
+        f = g[:, n:2 * n].sigmoid()
+        o = g[:, 2 * n:3 * n].sigmoid()
+        u = g[:, 3 * n:4 * n].tanh()
+        c_new = f * c + i * u
+        return o * c_new.tanh(), c_new
 
 
 class GRUCell(Module):
@@ -380,7 +524,8 @@ class GRUCell(Module):
 
 
 __all__ = [
-    "Parameter", "Module", "Linear", "Embedding", "LayerNorm", "BatchNorm1d", "Dropout",
-    "ReLU", "GELU", "Tanh", "Sigmoid", "Flatten", "Sequential", "Residual",
-    "Conv2d", "MaxPool2d", "MultiHeadAttention", "TransformerBlock", "RNNCell", "GRUCell",
+    "Parameter", "Module", "Linear", "Embedding", "LayerNorm", "RMSNorm", "BatchNorm1d",
+    "Dropout", "ReLU", "GELU", "SiLU", "Tanh", "Sigmoid", "Flatten", "Sequential", "Residual",
+    "Conv2d", "MaxPool2d", "AvgPool2d", "RotaryEmbedding", "MultiHeadAttention", "SwiGLU",
+    "TransformerBlock", "RNNCell", "GRUCell", "LSTMCell",
 ]

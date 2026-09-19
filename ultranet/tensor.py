@@ -11,6 +11,39 @@ import numpy as np
 
 ArrayLike = Union["Tensor", np.ndarray, float, int, list]
 
+# --------------------------------------------------------------- режим градиентов
+_GRAD_ENABLED = True
+
+
+def is_grad_enabled() -> bool:
+    return _GRAD_ENABLED
+
+
+class no_grad:
+    """Контекст/декоратор, отключающий построение графа (быстрый инференс).
+
+    >>> with no_grad():
+    ...     logits = model(x)
+    """
+
+    def __enter__(self) -> "no_grad":
+        global _GRAD_ENABLED
+        self._prev = _GRAD_ENABLED
+        _GRAD_ENABLED = False
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        global _GRAD_ENABLED
+        _GRAD_ENABLED = self._prev
+        return False
+
+    def __call__(self, fn):
+        def wrapper(*a, **kw):
+            with no_grad():
+                return fn(*a, **kw)
+
+        return wrapper
+
 
 def _unbroadcast(grad: np.ndarray, shape: Tuple[int, ...]) -> np.ndarray:
     """Свернуть градиент к исходной форме операнда после broadcasting."""
@@ -87,7 +120,7 @@ class Tensor:
         return x if isinstance(x, Tensor) else Tensor(x)
 
     def _make(self, data: np.ndarray, parents: Sequence["Tensor"], op: str) -> "Tensor":
-        req = any(p.requires_grad for p in parents)
+        req = _GRAD_ENABLED and any(p.requires_grad for p in parents)
         return Tensor(data, requires_grad=req, _children=parents if req else (), _op=op)
 
     def _accum(self, g: np.ndarray) -> None:
@@ -330,14 +363,71 @@ class Tensor:
         return out
 
     def softmax(self, axis: int = -1) -> "Tensor":
-        m = Tensor(self.data.max(axis=axis, keepdims=True))
-        e = (self - m).exp()
-        return e / e.sum(axis=axis, keepdims=True)
+        """Fused softmax: один узел графа вместо цепочки exp/sum/div."""
+        z = self.data - self.data.max(axis=axis, keepdims=True)
+        e = np.exp(z)
+        p = e / e.sum(axis=axis, keepdims=True)
+        out = self._make(p, (self,), "softmax")
+
+        def _backward() -> None:
+            g = out.grad
+            self._accum(p * (g - (g * p).sum(axis=axis, keepdims=True)))
+
+        out._backward = _backward
+        return out
 
     def log_softmax(self, axis: int = -1) -> "Tensor":
-        m = Tensor(self.data.max(axis=axis, keepdims=True))
-        z = self - m
-        return z - z.exp().sum(axis=axis, keepdims=True).log()
+        """Fused log-softmax — численно устойчив и дешевле по графу."""
+        z = self.data - self.data.max(axis=axis, keepdims=True)
+        lse = np.log(np.exp(z).sum(axis=axis, keepdims=True))
+        logp = z - lse
+        out = self._make(logp, (self,), "log_softmax")
+        p = np.exp(logp)
+
+        def _backward() -> None:
+            g = out.grad
+            self._accum(g - p * g.sum(axis=axis, keepdims=True))
+
+        out._backward = _backward
+        return out
+
+    def silu(self) -> "Tensor":
+        """SiLU / Swish: x * sigmoid(x) — используется в LLaMA-style MLP."""
+        s = 1.0 / (1.0 + np.exp(-self.data))
+        out = self._make(self.data * s, (self,), "silu")
+
+        def _backward() -> None:
+            self._accum(out.grad * (s * (1 + self.data * (1 - s))))
+
+        out._backward = _backward
+        return out
+
+    def abs(self) -> "Tensor":
+        out = self._make(np.abs(self.data), (self,), "abs")
+
+        def _backward() -> None:
+            self._accum(out.grad * np.sign(self.data))
+
+        out._backward = _backward
+        return out
+
+    def sin(self) -> "Tensor":
+        out = self._make(np.sin(self.data), (self,), "sin")
+
+        def _backward() -> None:
+            self._accum(out.grad * np.cos(self.data))
+
+        out._backward = _backward
+        return out
+
+    def cos(self) -> "Tensor":
+        out = self._make(np.cos(self.data), (self,), "cos")
+
+        def _backward() -> None:
+            self._accum(-out.grad * np.sin(self.data))
+
+        out._backward = _backward
+        return out
 
     def masked_fill(self, mask: np.ndarray, value: float) -> "Tensor":
         """mask=True -> подставить value (используется в causal-attention)."""

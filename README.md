@@ -1,30 +1,41 @@
-# UltraNet 🧠
+# UltraNet 🧠 v2
 
-**Ультимативная нейросеть на Python** — полноценный фреймворк глубокого обучения, написанный с нуля на чистом NumPy: собственный автоград, слои, оптимизаторы, тренер и готовые архитектуры вплоть до GPT-трансформера.
+**Ультимативная нейросеть на Python** — полноценный фреймворк глубокого обучения, написанный с нуля на чистом NumPy: собственный автоград, современные слои (RoPE, RMSNorm, SwiGLU), KV-кэш, оптимизаторы уровня 2023 года, тренер и CLI.
 
 Никакого PyTorch и TensorFlow — только NumPy и математика.
 
 ```
-ppl 71.71 ──► 1.08   (GPT, 1.1M параметров, 400 шагов, CPU)
+GPT-2 style    параметров 1,122,144 | loss 0.1298 | ppl 1.14 | 47.6s
+LLaMA style    параметров   668,160 | loss 0.0882 | ppl 1.09 | 26.7s   ← меньше и быстрее
 ```
 
-## Что внутри
+## Возможности
 
 | Модуль | Содержимое |
 |---|---|
-| `ultranet/tensor.py` | Автоград-движок: `Tensor` с динамическим графом, broadcasting, 30+ дифференцируемых операций |
-| `ultranet/nn.py` | `Linear`, `Conv2d` (im2col), `MaxPool2d`, `Embedding`, `LayerNorm`, `BatchNorm1d`, `Dropout`, `MultiHeadAttention`, `TransformerBlock`, `RNNCell`, `GRUCell`, `Sequential`, `Residual` |
-| `ultranet/optim.py` | `SGD` (momentum/Nesterov), `Adam`, `AdamW`, `RMSprop`, `CosineWarmup`, clipping градиентов |
-| `ultranet/functional.py` | `cross_entropy` (+ label smoothing), `binary_cross_entropy`, `mse_loss`, `accuracy` |
-| `ultranet/models.py` | `MLP`, `ConvNet`, `GPT` с авторегрессионной генерацией (temperature, top-k) |
-| `ultranet/trainer.py` | Цикл обучения, валидация, ранняя остановка, история метрик |
-| `ultranet/data.py` | `DataLoader`, `CharTokenizer`, синтетические датасеты (спирали, луны, картинки) |
+| `tensor.py` | Автоград-движок: динамический граф, broadcasting, **fused softmax/log-softmax**, `no_grad()`, 35+ операций |
+| `nn.py` | `Linear`, `Conv2d` (im2col), `MaxPool2d`, `AvgPool2d`, `Embedding`, `LayerNorm`, **`RMSNorm`**, `BatchNorm1d`, `Dropout`, **`RotaryEmbedding` (RoPE)**, `MultiHeadAttention` (**KV-кэш**), **`SwiGLU`**, `TransformerBlock`, `RNNCell`, `GRUCell`, `LSTMCell` |
+| `optim.py` | `SGD`, `Adam`, `AdamW`, `RMSprop`, `Adagrad`, **`Lion`**, **`Lookahead`**, **`EMA`** (с прогревом) + `CosineWarmup`, `OneCycleLR`, `StepLR`, `ReduceLROnPlateau` |
+| `functional.py` | **Fused `cross_entropy`** (label smoothing, `ignore_index`), `focal_loss`, `bce_with_logits`, `huber_loss`, `mae_loss`, метрики: `accuracy`, `top_k_accuracy`, `f1_score`, `confusion_matrix`, `perplexity` |
+| `models.py` | `MLP`, `ConvNet`, `ResNet`, `TextClassifier`, `GPT` (weight tying, top-k/top-p, repetition penalty, stop-токены) |
+| `trainer.py` | Прогресс-бар, валидация, ранняя остановка, **накопление градиентов**, EMA, чекпоинты, коллбэки, ASCII-графики |
+| `data.py` | `DataLoader`, `Dataset`, `CharTokenizer`, `WordTokenizer`, синтетические датасеты, `normalize` |
+| `cli.py` | `train-text`, `generate`, `demo`, `bench` |
 
 ## Установка
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+## CLI за 30 секунд
+
+```bash
+python -m ultranet demo                      # обучение + ASCII-графики
+python -m ultranet bench                     # бенчмарк скорости
+python -m ultranet train-text --llama --steps 300 --out model.pkl
+python -m ultranet generate --checkpoint model.pkl --prompt "нейронная" --top-p 0.9
 ```
 
 ## Быстрый старт
@@ -35,17 +46,29 @@ import ultranet as un
 x, y = un.make_spirals(n_per_class=400, n_classes=3)
 xtr, ytr, xte, yte = un.train_test_split(x, y, test_size=0.2)
 
-model = un.MLP([2, 96, 96, 64, 3], activation="gelu", dropout=0.05)
+model = un.MLP([2, 96, 96, 3], activation="gelu")
 opt = un.AdamW(model.parameters(), lr=4e-3, weight_decay=1e-4)
 
-trainer = un.Trainer(model, opt, grad_clip=1.0)
+trainer = un.Trainer(model, opt, grad_clip=1.0, ema_decay=0.99,
+                     accum_steps=2, checkpoint_path="best.pkl")
 trainer.fit(un.DataLoader(xtr, ytr, 64),
             un.DataLoader(xte, yte, 128, shuffle=False),
-            epochs=40, patience=10)
+            epochs=25, patience=8)
+print(trainer.plot_history())   # ASCII-график кривых обучения
 ```
-→ **100% accuracy** на тесте за считанные секунды.
+→ **99.2% accuracy**, с графиком прямо в терминале:
 
-### Своя языковая модель
+```
+ 0.6916 ┤*
+        │o
+        │   *
+        │      o
+ 0.0029 ┤             *   o  o   o  o  o   o  o   o  o   o  o   o
+        └────────────────────────────────────────────────────────
+         эпохи 1..17    * train  o val
+```
+
+### Языковая модель LLaMA-style
 
 ```python
 import ultranet as un
@@ -53,60 +76,84 @@ import ultranet as un
 tok = un.CharTokenizer(text)
 ids = tok.encode(text)
 
-cfg = un.GPTConfig(vocab_size=tok.vocab_size, block_size=48,
-                   n_layer=3, n_head=4, n_embd=96, dropout=0.05)
+cfg = un.GPTConfig.llama_style(tok.vocab_size,   # RoPE + RMSNorm + SwiGLU
+                               block_size=48, n_layer=3, n_head=4, n_embd=96)
 model = un.GPT(cfg)
-opt = un.AdamW(model.parameters(), lr=3e-3, weight_decay=1e-2)
+opt = un.AdamW(model.parameters(), lr=3e-3, weight_decay=0.01)
+sched = un.CosineWarmup(opt, warmup=30, total=300)
 
-for step in range(400):
+for _ in range(300):
     xb, yb = un.make_lm_batches(ids, cfg.block_size, batch_size=16)
     loss = un.cross_entropy(model(xb), yb)
-    opt.zero_grad(); loss.backward(); opt.clip_grad_norm(1.0); opt.step()
+    opt.zero_grad(); loss.backward(); opt.clip_grad_norm(1.0); opt.step(); sched.step()
 
 print(tok.decode(model.generate(tok.encode("нейронная "), 160,
-                                temperature=0.8, top_k=8)))
+                                temperature=0.7, top_p=0.9,
+                                repetition_penalty=1.1)))   # KV-кэш включён по умолчанию
 ```
+
+> `нейронная сеть учится на данных. градиент течёт назад через граф вычислений. трансформер смотрит на контекст через механизм внимания.`
 
 ### Автоград напрямую
 
 ```python
-from ultranet import Tensor
+from ultranet import Tensor, no_grad
 
 x = Tensor([[1., 2.], [3., 4.]], requires_grad=True)
 w = Tensor([[0.5], [-1.5]], requires_grad=True)
-loss = ((x @ w).gelu() ** 2).sum()
-loss.backward()
+((x @ w).silu() ** 2).sum().backward()
 print(x.grad, w.grad)
+
+with no_grad():          # инференс без построения графа
+    y = (x @ w).softmax(-1)
+```
+
+## Бенчмарк (чистый NumPy, CPU)
+
+```
+▸ Выигрыш no_grad() на инференсе
+▸ Слои
+  RMSNorm                                    0.52 ms  x1.73 быстрее LayerNorm
+▸ Генерация GPT (2.6M параметров)
+  без кэша (32 токенов)                    631.68 ms  19.7 ms/токен
+  с KV-кэшем (32 токенов)                  103.32 ms   3.2 ms/токен — x6.11
+▸ Пропускная способность обучения
+  GPT 1,994,240 парам., шаг обучения       164.17 ms  3,119 токенов/с
 ```
 
 ## Примеры
 
 ```bash
-PYTHONPATH=. python examples/01_classification.py  # MLP + ASCII-карта границ решений
+PYTHONPATH=. python examples/01_classification.py  # MLP + карта границ решений
 PYTHONPATH=. python examples/02_convnet.py         # CNN на изображениях
 PYTHONPATH=. python examples/03_gpt_text.py        # GPT генерирует текст
+PYTHONPATH=. python examples/04_regression.py      # регрессия: MSE vs MAE vs Huber
+PYTHONPATH=. python examples/05_llama_vs_gpt2.py   # сравнение архитектур
 ```
 
 ## Тесты
 
 ```bash
-PYTHONPATH=. python -m pytest tests -q
+python -m pytest -q     # 56 passed
 ```
 
-17 тестов, включая **численную проверку градиентов** (finite differences) для всех операций, свёрток, attention и LayerNorm, плюс сквозные проверки обучения MLP / CNN / GPT.
+Покрытие включает:
+- **численную проверку градиентов** (finite differences) для всех операций, свёрток, attention, RoPE, SwiGLU, RMSNorm, Huber/BCE
+- **эквивалентность KV-кэша** полному пересчёту (ошибка ~1e-8) и совпадение генерации cache/no-cache
+- **относительность RoPE**: скалярное произведение зависит только от разности позиций; норма векторов сохраняется
+- **эквивалентность накопления градиентов** одному большому батчу
+- сквозное обучение MLP / CNN / ResNet / TextClassifier / GPT (обе архитектуры), CLI-roundtrip
 
-```
-17 passed in 2.23s
-```
+## Что нового в v2
 
-## Ключевые особенности
-
-- **Обратное распространение** по топологически отсортированному графу с корректным сворачиванием broadcasting-осей
-- **Causal self-attention** с масками — проверено тестом, что будущие токены не влияют на прошлые
-- **Свёртки через im2col** — векторизованный forward и backward без циклов по батчу
-- **Pre-LN трансформер** в стиле GPT-2 с tanh-GELU
-- **Сохранение/загрузка весов**: `model.save(path)` / `model.load(path)`
-- Полностью типизированный код с документацией на русском
+- 🚀 **KV-кэш** — генерация в 6 раз быстрее
+- 🌀 **RoPE** — относительные позиции, экстраполяция за `block_size`
+- ⚡ **Fused cross-entropy и softmax** — аналитический градиент одним узлом
+- 🦙 **LLaMA-style пресет**: `GPTConfig.llama_style(...)` — RMSNorm + SwiGLU + RoPE
+- 🔗 **Weight tying** — экономия `vocab × n_embd` параметров
+- 🎲 **top-p (nucleus), repetition penalty, greedy, stop-токены**
+- 🏋️ **Lion, Lookahead, EMA, OneCycleLR, ReduceLROnPlateau**
+- 🖥️ **CLI** + бенчмарк + ASCII-визуализация кривых обучения
 
 ## Лицензия
 
