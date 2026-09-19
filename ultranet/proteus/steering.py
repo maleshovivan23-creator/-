@@ -60,10 +60,30 @@ class SteeringLibrary:
         self.vectors: Dict[str, SteeringVector] = {}
 
     def _as_ids(self, sample) -> List[int]:
-        """Принимаем и текст, и готовые id — так пользоваться удобнее."""
+        """Принимаем и текст, и байты, и готовые id — так пользоваться удобнее."""
         if isinstance(sample, str):
             return self.tok.encode(sample)
+        if isinstance(sample, (bytes, bytearray)):
+            return [int(b) for b in sample]
         return [int(t) for t in sample]
+
+    @staticmethod
+    def _check_batch(samples, argname: str) -> Sequence:
+        """Отсечь голую строку, переданную вместо списка примеров.
+
+        `learn(positive="текст")` — частая опечатка: строка итерируется
+        посимвольно, вектор получается бессмысленным, и никто об этом не
+        узнаёт. Молча неверный результат хуже падения, поэтому падаем.
+        """
+        if isinstance(samples, (str, bytes, bytearray)):
+            raise TypeError(
+                f"{argname} должен быть списком примеров, а не одной строкой: "
+                f"строка будет разобрана посимвольно. "
+                f"Передайте [{argname}] — список из одного элемента.")
+        if not isinstance(samples, Sequence) and not hasattr(samples, "__iter__"):
+            raise TypeError(f"{argname}: ожидается последовательность примеров, "
+                            f"получено {type(samples).__name__}")
+        return samples
 
     def _resolve_layer(self, layer: int) -> int:
         """Отрицательный индекс считается от конца, как в Python."""
@@ -93,6 +113,11 @@ class SteeringLibrary:
               negative: Sequence[Sequence[int]], layer: int = 2,
               strength: float = 1.0, normalize: bool = True) -> SteeringVector:
         """Контрастный вектор: среднее(positive) − среднее(negative)."""
+        positive = self._check_batch(positive, "positive")
+        negative = self._check_batch(negative, "negative")
+        if len(positive) == 0 or len(negative) == 0:
+            raise ValueError("positive и negative не должны быть пустыми: "
+                             "контрастный вектор строится как разность средних")
         d = self.model.width_dim(1.0)
         layer = self._resolve_layer(layer)
         pos = self._mean_activation(positive, layer, d)

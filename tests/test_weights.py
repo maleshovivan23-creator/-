@@ -366,6 +366,7 @@ class TestComparison:
     def test_report_str(self, w):
         assert "бит/вес" in str(compare_methods(w, rvq_stages=1)[0])
 
+    @pytest.mark.slow
     def test_quality_on_real_trained_model(self):
         """Главная проверка: сжатые веса сохраняют качество РАБОЧЕЙ модели."""
         un.manual_seed(0)

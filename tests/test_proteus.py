@@ -118,6 +118,7 @@ def test_fewer_layers_runs():
     assert out.shape[1] == 3
 
 
+@pytest.mark.slow
 def test_matryoshka_training_makes_all_sizes_work():
     """Ключевой тест: после обучения КАЖДЫЙ срез предсказывает лучше случайного."""
     un.manual_seed(0)
@@ -190,6 +191,7 @@ def test_real_compression_ratio_vs_fp32():
     assert stats.ratio_vs_fp16 > 5.0
 
 
+@pytest.mark.slow
 def test_quantized_model_still_predicts_better_than_random():
     """Сжатие не превращает модель в мусор."""
     un.manual_seed(0)

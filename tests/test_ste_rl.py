@@ -120,6 +120,7 @@ class TestRLMetaController:
         biggest = len(rl.actions) - 1
         assert rl.reward(biggest, empty, 0.5) < rl.reward(biggest, full, 0.5)
 
+    @pytest.mark.slow
     def test_training_improves_reward(self):
         rl = RLMetaController(_model(), lr=0.3, seed=0)
         states = _states()
@@ -127,6 +128,7 @@ class TestRLMetaController:
         rl.train(states, steps=4000)
         assert rl.mean_reward(states) > before
 
+    @pytest.mark.slow
     def test_training_reaches_most_of_the_optimum(self):
         rl = RLMetaController(_model(), lr=0.3, seed=0)
         states = _states()
@@ -135,6 +137,7 @@ class TestRLMetaController:
         rl.train(states, steps=6000)
         assert rl.mean_reward(states) >= 0.93 * optimum
 
+    @pytest.mark.slow
     def test_learned_policy_beats_random_policy(self):
         rl = RLMetaController(_model(), lr=0.3, seed=0)
         states = _states()
@@ -145,6 +148,7 @@ class TestRLMetaController:
         rl.train(states, steps=4000)
         assert rl.mean_reward(states) > random_reward
 
+    @pytest.mark.slow
     def test_hot_device_gets_smaller_model_than_cool_one(self):
         rl = RLMetaController(_model(), lr=0.3, seed=0)
         rl.train(_states(), steps=6000)
@@ -152,6 +156,7 @@ class TestRLMetaController:
         hot = rl.plan(DeviceState(get_device("phone"), temperature_c=95.0), 0.5)
         assert hot.active_params <= cool.active_params
 
+    @pytest.mark.slow
     def test_plan_respects_memory_budget(self):
         rl = RLMetaController(_model(), lr=0.3, seed=0)
         states = _states()
@@ -174,6 +179,7 @@ class TestRLMetaController:
         rl.train(_states(), steps=120)
         assert len(rl.history) == 120
 
+    @pytest.mark.slow
     def test_greedy_plan_is_reproducible(self):
         rl = RLMetaController(_model(), lr=0.3, seed=0)
         rl.train(_states(), steps=2000)
