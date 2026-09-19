@@ -1,6 +1,8 @@
 """Proteus — подсистема UltraNet: вложенная байтовая модель, живущая на любом железе."""
 from .adapt import Feedback, LoRALayer, PersonalAdapter
+from .assembly import Assembly, ProteusBody, detect_triggers
 from .capsules import Capsule, CapsuleRegistry, Level
+from .catalog import CATALOG, BY_KEY, CapsuleSpec, Group, Stage, by_group
 from .context import Activity, AdaptationLoops, Context, Place, Style, style_for
 from .core import Proteus, Response
 from .experts import MoE, Expert
@@ -20,6 +22,8 @@ __all__ = [
     "MoE", "Expert", "SteeringLibrary", "SteeringVector",
     "PersonalAdapter", "LoRALayer", "Feedback",
     "Capsule", "CapsuleRegistry", "Level",
+    "CATALOG", "BY_KEY", "CapsuleSpec", "Group", "Stage", "by_group",
+    "ProteusBody", "Assembly", "detect_triggers",
     "Shard", "ShardedSwarm", "SwarmNode",
     "Context", "Activity", "Place", "Style", "style_for", "AdaptationLoops",
     "ByteTokenizer", "make_byte_batches",

@@ -14,6 +14,7 @@ import numpy as np
 from ..tensor import no_grad
 from .adapt import Feedback, PersonalAdapter
 from .bytes import ByteTokenizer
+from .assembly import Assembly, ProteusBody
 from .capsules import CapsuleRegistry
 from .controller import MetaController, Plan
 from .devices import Device, DeviceState, get_device
@@ -89,6 +90,7 @@ class Proteus:
         self.adapter: Optional[PersonalAdapter] = None
         self.capsules: Optional[CapsuleRegistry] = None
         self.task_vectors: Dict[str, str] = {}   # тип задачи -> имя steering-вектора
+        self.body = ProteusBody(self.state.device, self.state)  # каталог 48 капсул
 
     # ------------------------------------------------------------ конструкторы
     @classmethod
@@ -117,6 +119,10 @@ class Proteus:
         """Включить персонализацию (LoRA поверх замороженного ядра)."""
         self.adapter = PersonalAdapter(self.model, rank=rank)
         return self.adapter
+
+    def plan_capsules(self, prompt: str) -> Assembly:
+        """Какие из 48 капсул каталога нужны этому запросу на этом железе."""
+        return self.body.assemble(prompt)
 
     def enable_capsules(self, skills_by_expert: Optional[Dict[int, set]] = None
                         ) -> CapsuleRegistry:
