@@ -1,7 +1,37 @@
-# Запуск обучения: один файл
+# Запуск: один файл
 
-`proteus_train.py` — всё в одном: токенизатор, модель, данные, обучение.
-Ничего из репозитория не импортирует. Работает в Colab и Kaggle.
+Есть два самодостаточных файла, оба работают в Colab и Kaggle.
+
+| файл | что внутри | когда брать |
+|---|---|---|
+| **`proteus_colab.py`** | **весь проект** — 35 модулей, ядро, Протей, обучение | нужен весь Протей |
+| `proteus_train.py` | только обучение на TinyStories | нужно лишь обучить модель |
+
+## proteus_colab.py — весь проект
+
+```python
+!pip install -q datasets
+!wget -q https://raw.githubusercontent.com/maleshovivan23-creator/-/arena/01a0b93c-repo/proteus_colab.py
+
+!python proteus_colab.py           # самопроверка: что внутри и работает ли
+!python proteus_colab.py --steps 200                  # проба обучения
+!python proteus_colab.py --steps 60000 --max-hours 11 # полный прогон
+```
+
+Импорты работают как у установленного пакета:
+
+```python
+import proteus_colab                     # регистрирует ultranet.* в sys.modules
+from ultranet.models import GPT, GPTConfig
+from ultranet.proteus import Proteus, MatFormer, MetaController
+```
+
+Проверено: все 460 тестов репозитория проходят против этого файла.
+
+## proteus_train.py — только обучение
+
+Всё в одном: токенизатор, модель, данные, обучение.
+Ничего из репозитория не импортирует.
 
 ## Kaggle
 
